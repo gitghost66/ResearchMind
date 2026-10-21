@@ -1,0 +1,13 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./backend/app:/app/backend/app
+      - ./agents/researchmind_agents:/app/agents/researchmind_agents
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
