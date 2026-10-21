@@ -74,7 +74,7 @@ Client ──REST/SSE──► FastAPI ──async task──► LangGraph Workf
 ## Milestones
 
 - [x] **M0** — Foundation (scaffold, config, health endpoint)
-- [ ] **M1** — Data layer (SQLAlchemy models, Alembic migrations, pgvector)
+- [x] **M1** — Data layer (SQLAlchemy models, Alembic migrations, pgvector)
 - [ ] **M2** — LLM and tool layer (Gemini wrapper, search, page extraction)
 - [ ] **M3** — MVP graph (Planner → Web Research → Synthesizer)
 - [ ] **M4** — API and background jobs (full REST API, SSE streaming)
