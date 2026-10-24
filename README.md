@@ -42,8 +42,21 @@ A multi-agent AI research system that decomposes complex questions, researches t
 
 ### Run Tests
 ```bash
+# Both packages from the repo root
+pytest
+
+# Or per package
 cd backend && pytest
 cd ../agents && pytest
+```
+
+Tests mock every LLM, search, and HTTP call, so the suite runs with no API keys
+and no database. Tests needing live services are marked `integration` and skip
+unless their environment variable is set:
+
+```bash
+# Verifies the Alembic migration against a real PostgreSQL + pgvector
+DATABASE_URL=postgresql+asyncpg://... pytest -m integration
 ```
 
 ### Run Quality Checks
@@ -51,6 +64,24 @@ cd ../agents && pytest
 ruff check .
 mypy backend/app agents/researchmind_agents
 ```
+
+## LLM providers
+
+The LLM layer is provider-agnostic; the choice is config, not code.
+
+| `LLM_PROVIDER` | Transport | Keys |
+|---|---|---|
+| `gemini` (default) | `google-genai` | `GEMINI_API_KEY` |
+| `openai_compatible` / `openrouter` / `groq` | OpenAI chat-completions over httpx | `LLM_BASE_URL`, `LLM_API_KEY` |
+
+Every call goes through the wrapper, which handles retries, Pydantic-validated
+structured output (re-prompting with the validation error on failure), and
+writes a row to `llm_usage` with tokens, latency, and USD cost. Cost is
+computed from `LLM_PRICE_PER_1M_*` or a built-in table, and is `0.0` on free
+tiers rather than estimated.
+
+Embeddings always use `google-genai`, independently of `LLM_PROVIDER`, so an
+OpenAI-compatible LLM can be paired with Gemini embeddings.
 
 ## Architecture
 
@@ -75,7 +106,9 @@ Client ──REST/SSE──► FastAPI ──async task──► LangGraph Workf
 
 - [x] **M0** — Foundation (scaffold, config, health endpoint)
 - [x] **M1** — Data layer (SQLAlchemy models, Alembic migrations, pgvector)
-- [ ] **M2** — LLM and tool layer (Gemini wrapper, search, page extraction)
+- [x] **M2** — LLM and tool layer (provider-agnostic wrapper with usage/cost
+      recording, embeddings, search with TTL cache, SSRF-guarded page extraction,
+      vector search)
 - [ ] **M3** — MVP graph (Planner → Web Research → Synthesizer)
 - [ ] **M4** — API and background jobs (full REST API, SSE streaming)
 - [ ] **M5** — Specialized agents and verification

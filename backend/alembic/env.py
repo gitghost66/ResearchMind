@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 from app.core.config import get_settings
+from app.db.ddl import ensure_pgvector
 from app.models import Base
 
 # this is the Alembic Config object, which provides
@@ -47,9 +48,8 @@ def do_run_migrations(connection: Connection) -> None:
     )
 
     with context.begin_transaction():
-        # Ensure pgvector extension exists before creating tables
-        if connection.dialect.name == "postgresql":
-            connection.execute(target_metadata.tables.get("passages", None) and "CREATE EXTENSION IF NOT EXISTS vector")  # type: ignore[arg-type]
+        # Ensure pgvector exists before any table with a Vector column is created.
+        ensure_pgvector(connection)
         context.run_migrations()
 
 

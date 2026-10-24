@@ -50,3 +50,6 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
 addopts = "--import-mode=importlib"
+markers = [
+    "integration: needs live external services (real DB or API keys); skipped by default",
+]
