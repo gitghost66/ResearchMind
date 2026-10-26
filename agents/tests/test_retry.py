@@ -20,6 +20,12 @@ GEMINI_429 = (
     "quota... Please retry in 46.816531493s.', 'status': 'RESOURCE_EXHAUSTED', 'details': "
     "[{'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': '46s'}]}}"
 )
+# Shape of a real Gemini overload 503: no retry hint.
+GEMINI_503 = (
+    "503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing "
+    "high demand. Spikes in demand are usually temporary. Please try again later.', "
+    "'status': 'UNAVAILABLE'}}"
+)
 
 
 class TestRetryAfterSeconds:
@@ -104,11 +110,67 @@ class TestRetryAsyncWaits:
         assert factory.calls == 1
 
 
+class TestOverloadWaits:
+    async def test_overload_backs_off_from_overload_delay(self) -> None:
+        factory = _Flaky([TransientLLMError(GEMINI_503), TransientLLMError(GEMINI_503)])
+        result, sleeps = await run_with_sleeps(
+            factory, max_attempts=3, base_delay=1.0, overload_delay=10.0
+        )
+        assert result == "ok"
+        assert sleeps == [10.0, 20.0]
+
+    async def test_overload_wait_is_capped_by_max_delay(self) -> None:
+        factory = _Flaky([TransientLLMError(GEMINI_503), TransientLLMError(GEMINI_503)])
+        _, sleeps = await run_with_sleeps(
+            factory, max_attempts=3, base_delay=1.0, max_delay=15.0, overload_delay=10.0
+        )
+        assert sleeps == [10.0, 15.0]
+
+    async def test_rate_limit_without_hint_keeps_normal_backoff(self) -> None:
+        factory = _Flaky([TransientLLMError("429 too many requests")] * 2)
+        _, sleeps = await run_with_sleeps(
+            factory, max_attempts=3, base_delay=1.0, overload_delay=10.0
+        )
+        assert sleeps == [1.0, 2.0]
+
+    async def test_server_hint_wins_over_overload_delay(self) -> None:
+        factory = _Flaky([TransientLLMError("503 unavailable, retry in 3s")])
+        _, sleeps = await run_with_sleeps(
+            factory, max_attempts=2, base_delay=1.0, overload_delay=10.0
+        )
+        assert sleeps == [3.0]
+
+    async def test_overload_is_read_from_the_status_code(self) -> None:
+        request = httpx.Request("POST", "https://api.example/v1")
+        response = httpx.Response(503, request=request)
+        factory = _Flaky([httpx.HTTPStatusError("server blew up", request=request, response=response)])
+        _, sleeps = await run_with_sleeps(
+            factory, max_attempts=2, base_delay=1.0, overload_delay=10.0
+        )
+        assert sleeps == [10.0]
+
+
 class TestConfig:
     def test_max_retry_delay_maps_to_llm_and_embeddings(self) -> None:
         config = AgentConfig.from_mapping({"llm_max_retry_delay": 15.0})
         assert config.llm.max_retry_delay == 15.0
         assert config.embedding.max_retry_delay == 15.0
+
+    def test_overload_delay_maps_to_llm_and_embeddings(self) -> None:
+        config = AgentConfig.from_mapping({"llm_overload_retry_delay": 4.0})
+        assert config.llm.overload_delay == 4.0
+        assert config.embedding.overload_delay == 4.0
+
+    def test_default_overload_retries_outlast_a_short_spike(self) -> None:
+        config = AgentConfig.from_mapping({})
+        # 3 attempts wait 10s + 20s; a 1s/2s back-off met the same spike in live runs.
+        assert config.llm.overload_delay >= 5
+        # Every overload wait plus a slow generation must fit inside one node timeout.
+        waits = sum(
+            min(config.llm.overload_delay * 2**n, config.llm.max_retry_delay)
+            for n in range(config.llm.max_attempts - 1)
+        )
+        assert config.agent_timeout > waits + 120
 
     def test_defaults_wait_out_a_free_tier_minute(self) -> None:
         config = AgentConfig.from_mapping({})

@@ -13,7 +13,8 @@ run ``alembic upgrade head`` first; ``--store memory`` needs no database;
 ``auto`` (default) uses the database when DATABASE_URL is set.
 
 Prints the markdown report, a usage summary, and the grounding check. Exits
-non-zero when a run fails or misses the grounding targets.
+non-zero when a run fails, misses the grounding targets, or falls back to an
+extractive report (the model did not write it).
 """
 
 from __future__ import annotations
@@ -147,15 +148,21 @@ async def _one(
                 "seconds": time.monotonic() - started, "passed": False}
 
     grounding = check_grounding(outcome.report, outcome.markdown, outcome.stored_source_ids)
+    generation = outcome.report.get("generation")
     return {
         "id": row_id,
         "question": question,
         "run_id": outcome.run_id,
-        "generation": outcome.report.get("generation"),
+        "generation": generation,
         "sources": len(outcome.report.get("sources", [])),
         "sources_stored": len(outcome.stored_source_ids),
+        # Includes why the model did not write the report, if it fell back.
+        "limitations": outcome.report.get("limitations", []),
         "grounding": grounding,
-        "passed": grounding.passes(min_resolution=args.min_resolved, min_cited=args.min_cited),
+        # An extractive fallback quotes passages, so it is cited by construction;
+        # only a model-written report tests the synthesizer.
+        "passed": generation == "llm"
+        and grounding.passes(min_resolution=args.min_resolved, min_cited=args.min_cited),
         "tokens": outcome.usage["tokens_used"],
         "cost_usd": outcome.usage["cost_usd"],
         "usage": outcome.usage,

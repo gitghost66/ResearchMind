@@ -184,6 +184,7 @@ class EmbeddingService:
                 max_attempts=self._config.max_attempts,
                 base_delay=self._config.base_delay,
                 max_delay=self._config.max_retry_delay,
+                overload_delay=self._config.overload_delay,
                 description=f"embed:{self._config.model}",
             )
         except Exception as exc:  # noqa: BLE001 - a failed batch degrades, not crashes

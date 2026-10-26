@@ -57,7 +57,11 @@ python backend/scripts/run_mvp.py --seed
 
 On Gemini's free tier a run takes about 1.5–2 minutes: embeddings are capped at
 30k tokens per minute, so the run waits out the rate limit (up to
-`LLM_MAX_RETRY_DELAY`) instead of dropping passages.
+`LLM_MAX_RETRY_DELAY`) instead of dropping passages. When Gemini answers
+503 "high demand", calls retry after `LLM_OVERLOAD_RETRY_DELAY` (10 s, doubling).
+If the model still cannot write the report, the run stores an extractive report
+that quotes passages; the seed eval counts that as a failure, since it does not
+test the synthesizer.
 
 `--store memory` runs with no database. `--store db` persists the run, sources,
 passages, events, usage, and report to `DATABASE_URL`; apply migrations first

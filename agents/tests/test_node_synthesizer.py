@@ -9,9 +9,11 @@ then dropped, and every path ends with a stored report.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from typing import Any
+from unittest.mock import patch
 
 from researchmind_agents.config import AgentConfig, SynthesizerConfig
 from researchmind_agents.nodes.synthesizer import make_synthesizer_node
@@ -197,6 +199,29 @@ class TestCitationRetry:
 
         assert len(llm_of(runtime).calls_for("ReportOutput")) == 1
         assert result["report"]["dropped_statements"] == 1
+
+    async def test_retry_timeout_keeps_the_first_draft(self) -> None:
+        """A timeout during the citation retry must not discard a usable first draft."""
+        first = report_json(("Supported.", ["S1"]), ("Invented.", ["S99"]))
+        runtime = build_fake_runtime(AgentConfig(agent_timeout=1), responses={"ReportOutput": first})
+        state = await seed(runtime, PAGES)
+        llm = llm_of(runtime)
+        complete = llm._complete
+
+        async def hang_on_retry(**kwargs: Any) -> Any:
+            if llm.calls_for("ReportOutput"):  # the first draft is already written
+                await asyncio.sleep(30)
+            return await complete(**kwargs)
+
+        with patch.object(llm, "_complete", hang_on_retry):
+            result = await make_synthesizer_node(runtime)(state)
+
+        report = result["report"]
+        assert report["generation"] == "llm"
+        assert [s["text"] for s in report["sections"][0]["statements"]] == ["Supported."]
+        assert report["dropped_statements"] == 1
+        errors = [e["payload"]["message"] for e in result["events"] if e["type"] == "error"]
+        assert "Citation retry failed; keeping the first draft" in errors
 
 
 class TestFallbacks:

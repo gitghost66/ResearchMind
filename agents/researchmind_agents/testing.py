@@ -126,7 +126,9 @@ class ScriptedLLM(BaseLLMProvider):
         responses: dict[str, Responder | list[Responder]] | None = None,
         tokens: tuple[int, int] = (100, 50),
     ) -> None:
-        super().__init__(config or LLMConfig(model="scripted", base_delay=0.0), usage_sink)
+        super().__init__(
+            config or LLMConfig(model="scripted", base_delay=0.0, overload_delay=0.0), usage_sink
+        )
         self._responses: dict[str, list[Responder]] = {
             key: [value] for key, value in _DEFAULT_RESPONDERS.items()
         }
@@ -260,7 +262,7 @@ class _FakeEmbedModels:
 def fake_embedding_service(config: EmbeddingConfig | None = None) -> EmbeddingService:
     """The real :class:`EmbeddingService` over a deterministic in-process client."""
     return EmbeddingService(
-        config or EmbeddingConfig(base_delay=0.0),
+        config or EmbeddingConfig(base_delay=0.0, overload_delay=0.0),
         client=SimpleNamespace(models=_FakeEmbedModels()),
     )
 
@@ -288,7 +290,10 @@ def build_fake_runtime(
         usage_sink=usage_sink,
         # No back-off sleeps in tests.
         llm_factory=lambda llm_config, sink: ScriptedLLM(
-            replace(llm_config, base_delay=0.0), sink, responses=responses, tokens=tokens
+            replace(llm_config, base_delay=0.0, overload_delay=0.0),
+            sink,
+            responses=responses,
+            tokens=tokens,
         ),
         embeddings=fake_embedding_service(config.embedding),
         search=SearchTool(config.search, provider=FakeSearchProvider(web)),

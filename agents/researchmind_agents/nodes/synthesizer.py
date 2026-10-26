@@ -321,6 +321,7 @@ async def _write(
         ],
     )
 
+    output: ReportOutput | None = None
     try:
         async with asyncio.timeout(runtime.config.agent_timeout):
             output = await _generate(runtime, run_id, prompt, draft)
@@ -345,9 +346,14 @@ async def _write(
                         reason=f"{type(exc).__name__}: {exc}",
                     )
     except Exception as exc:  # noqa: BLE001 - extractive fallback
-        draft.failure = f"{type(exc).__name__}: {exc}"
-        await log.error("Report generation failed", reason=draft.failure)
-        return draft
+        reason = f"{type(exc).__name__}: {exc}"
+        if output is None:
+            draft.failure = reason
+            await log.error("Report generation failed", reason=reason)
+            return draft
+        # The timeout cancelled the citation retry, which the inner handler
+        # cannot catch; the first draft is still usable.
+        await log.error("Citation retry failed; keeping the first draft", reason=reason)
 
     cleaned, dropped = enforce_citations(output, allowed)
     if dropped:

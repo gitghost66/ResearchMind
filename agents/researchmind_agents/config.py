@@ -37,6 +37,9 @@ class LLMConfig:
     # Longest single wait between retries. A rate-limit error that names its
     # own wait ("retry in 46s") is honoured up to this cap.
     max_retry_delay: float = 60.0
+    # First wait after an overload (503 "high demand") that names no wait;
+    # doubles per attempt. A 1s retry usually meets the same spike.
+    overload_delay: float = 10.0
     # Schema-validation retries, fed the validation error (PRD s6.3).
     structured_retries: int = 2
     request_timeout: float = 120.0
@@ -61,6 +64,7 @@ class EmbeddingConfig:
     max_attempts: int = 3
     base_delay: float = 1.0
     max_retry_delay: float = 60.0
+    overload_delay: float = 10.0
     api_key: str = ""
 
 
@@ -191,6 +195,7 @@ class AgentConfig:
             max_attempts=pick("llm_max_attempts", LLMConfig.max_attempts),
             base_delay=pick("llm_retry_base_delay", LLMConfig.base_delay),
             max_retry_delay=pick("llm_max_retry_delay", LLMConfig.max_retry_delay),
+            overload_delay=pick("llm_overload_retry_delay", LLMConfig.overload_delay),
             structured_retries=pick("llm_structured_retries", LLMConfig.structured_retries),
             request_timeout=pick("agent_timeout", LLMConfig.request_timeout),
             price_per_1m_input=pick("llm_price_per_1m_input", LLMConfig.price_per_1m_input),
@@ -208,6 +213,7 @@ class AgentConfig:
             max_attempts=pick("llm_max_attempts", EmbeddingConfig.max_attempts),
             base_delay=pick("llm_retry_base_delay", EmbeddingConfig.base_delay),
             max_retry_delay=pick("llm_max_retry_delay", EmbeddingConfig.max_retry_delay),
+            overload_delay=pick("llm_overload_retry_delay", EmbeddingConfig.overload_delay),
             api_key=pick("gemini_api_key", EmbeddingConfig.api_key),
         )
 

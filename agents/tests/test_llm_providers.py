@@ -63,6 +63,7 @@ def gemini(**overrides: Any) -> GeminiProvider:
     overrides.setdefault("api_key", "test-key")
     overrides.setdefault("model", "gemini-3.1-flash-lite")
     overrides.setdefault("base_delay", 0.0)
+    overrides.setdefault("overload_delay", 0.0)
     return GeminiProvider(LLMConfig(**overrides))
 
 

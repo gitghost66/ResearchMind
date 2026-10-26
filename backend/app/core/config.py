@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     llm_retry_base_delay: float = 1.0
     # Cap on one retry wait; rate-limit errors naming a wait are honoured up to it.
     llm_max_retry_delay: float = 60.0
+    # First wait after a 503 "high demand" that names no wait (LLM and
+    # embeddings); doubles per attempt.
+    llm_overload_retry_delay: float = 10.0
     # Schema-validation repair attempts for structured output (PRD s6.3).
     llm_structured_retries: int = 2
     # USD per 1M tokens; 0.0 is correct for free tiers. Non-zero overrides the

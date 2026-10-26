@@ -173,6 +173,17 @@ _TRANSIENT_PATTERN = re.compile(
 
 _TRANSIENT_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
+# The provider is shedding load ("503 UNAVAILABLE ... high demand"). A retry a
+# second later usually meets the same spike, so these get a longer wait.
+_OVERLOAD_PATTERN = re.compile(r"\b(503|unavailable|overloaded|high demand)\b", re.IGNORECASE)
+
+
+def _status_codes(exc: BaseException) -> set[int]:
+    """Numeric HTTP statuses on *exc*; httpx and google-genai use different attributes."""
+    values = [getattr(exc, attr, None) for attr in ("status_code", "code", "status")]
+    values.append(getattr(getattr(exc, "response", None), "status_code", None))
+    return {value for value in values if isinstance(value, int)}
+
 
 def _is_transient(exc: BaseException) -> bool:
     """Decide whether *exc* is worth another attempt."""
@@ -182,18 +193,14 @@ def _is_transient(exc: BaseException) -> bool:
         return False
     if isinstance(exc, asyncio.TimeoutError | TimeoutError):
         return True
-
-    # httpx and google-genai both expose a numeric status in one of these.
-    for attr in ("status_code", "code", "status"):
-        value = getattr(exc, attr, None)
-        if isinstance(value, int) and value in _TRANSIENT_STATUS:
-            return True
-    response = getattr(exc, "response", None)
-    status = getattr(response, "status_code", None)
-    if isinstance(status, int) and status in _TRANSIENT_STATUS:
+    if _status_codes(exc) & _TRANSIENT_STATUS:
         return True
-
     return bool(_TRANSIENT_PATTERN.search(str(exc)))
+
+
+def _is_overload(exc: BaseException) -> bool:
+    """Whether *exc* says the provider is overloaded (503), as opposed to rate-limited."""
+    return 503 in _status_codes(exc) or bool(_OVERLOAD_PATTERN.search(str(exc)))
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +419,7 @@ class BaseLLMProvider(ABC):
             max_attempts=self._config.max_attempts,
             base_delay=self._config.base_delay,
             max_delay=self._config.max_retry_delay,
+            overload_delay=self._config.overload_delay,
             description=f"{self.provider_name}:{self._config.model}",
         )
         latency_ms = (time.monotonic() - started) * 1000
@@ -491,6 +499,7 @@ async def retry_async(
     max_attempts: int,
     base_delay: float,
     max_delay: float | None = None,
+    overload_delay: float = 0.0,
     description: str = "call",
 ) -> Any:
     """
@@ -500,7 +509,8 @@ async def retry_async(
     a bad API key fails fast instead of sleeping through three attempts. When a
     rate-limit error says how long to wait, that wait is used if it is longer
     than the back-off — retrying a per-minute quota after 1s just fails again.
-    *max_delay* caps any single wait.
+    An overload (503) that names no wait backs off from *overload_delay*
+    instead of *base_delay*. *max_delay* caps any single wait.
     """
     attempts = max(1, max_attempts)
     for attempt in range(attempts):
@@ -513,6 +523,8 @@ async def retry_async(
             hint = retry_after_seconds(exc)
             if hint is not None:
                 delay = max(delay, hint)
+            elif overload_delay > 0 and _is_overload(exc):
+                delay = max(delay, overload_delay * (2**attempt))
             if max_delay is not None and max_delay > 0:
                 delay = min(delay, max_delay)
             logger.warning(
