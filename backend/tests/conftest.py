@@ -8,11 +8,18 @@ from sqlalchemy import event
 from sqlalchemy.engine import Engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.main import app
 from app.models.base import Base
 
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
+
+# The suite must behave the same on every machine and in CI, so it never reads
+# a developer's real .env (API keys, DATABASE_URL). Tests that need a value
+# pass it to Settings(...) explicitly.
+Settings.model_config["env_file"] = None
+get_settings.cache_clear()
 
 
 # Enable foreign key support for SQLite connections

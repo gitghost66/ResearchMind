@@ -411,6 +411,7 @@ class BaseLLMProvider(ABC):
             run,
             max_attempts=self._config.max_attempts,
             base_delay=self._config.base_delay,
+            max_delay=self._config.max_retry_delay,
             description=f"{self.provider_name}:{self._config.model}",
         )
         latency_ms = (time.monotonic() - started) * 1000
@@ -456,18 +457,50 @@ class BaseLLMProvider(ABC):
 # ---------------------------------------------------------------------------
 
 
+# "Please retry in 46.8s." / "'retryDelay': '46s'" — how Gemini's 429s say when.
+_RETRY_HINT = re.compile(
+    r"retry(?:[ _-]?delay)?['\"]?\s*(?:in|:|=)\s*['\"]?(\d+(?:\.\d+)?)\s*s\b",
+    re.IGNORECASE,
+)
+
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """
+    The wait the server asked for, if it said: a ``Retry-After`` header
+    (seconds form) or a retry delay in the error text.
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            value = headers.get("retry-after")
+        except Exception:  # noqa: BLE001 - odd header containers
+            value = None
+        if value:
+            try:
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                pass
+    match = _RETRY_HINT.search(str(exc))
+    return float(match.group(1)) if match else None
+
+
 async def retry_async(
     factory: Callable[[], Awaitable[Any]],
     *,
     max_attempts: int,
     base_delay: float,
+    max_delay: float | None = None,
     description: str = "call",
 ) -> Any:
     """
     Await ``factory()`` up to *max_attempts* times with exponential back-off.
 
     Only transient failures are retried; anything else propagates immediately so
-    a bad API key fails fast instead of sleeping through three attempts.
+    a bad API key fails fast instead of sleeping through three attempts. When a
+    rate-limit error says how long to wait, that wait is used if it is longer
+    than the back-off — retrying a per-minute quota after 1s just fails again.
+    *max_delay* caps any single wait.
     """
     attempts = max(1, max_attempts)
     for attempt in range(attempts):
@@ -477,17 +510,29 @@ async def retry_async(
             if attempt == attempts - 1 or not _is_transient(exc):
                 raise
             delay = base_delay * (2**attempt)
+            hint = retry_after_seconds(exc)
+            if hint is not None:
+                delay = max(delay, hint)
+            if max_delay is not None and max_delay > 0:
+                delay = min(delay, max_delay)
             logger.warning(
                 "%s failed (attempt %d/%d), retrying in %.1fs: %s",
                 description,
                 attempt + 1,
                 attempts,
                 delay,
-                exc,
+                _short(exc),
             )
             await asyncio.sleep(delay)
     # Unreachable: the loop either returns or raises.
     raise LLMError(f"{description} exhausted all retries")
+
+
+def _short(exc: BaseException, limit: int = 200) -> str:
+    """First line of an error, truncated: provider errors can be kilobytes of JSON."""
+    lines = str(exc).strip().splitlines()
+    text = lines[0] if lines else type(exc).__name__
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _try_validate(schema: type[T], completion: RawCompletion) -> T | None:

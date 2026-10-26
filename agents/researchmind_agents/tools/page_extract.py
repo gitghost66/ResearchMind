@@ -167,7 +167,10 @@ class PageExtractTool:
             logger.info("robots.txt disallowed url=%r", url)
             return PageContent(url=url, error=f"robots disallowed: {exc}")
         except Exception as exc:  # noqa: BLE001 - degrade, don't crash the run
-            logger.warning("Page extraction failed url=%r: %s", url, exc)
+            # httpx errors append a multi-line help link; the first line is enough.
+            logger.warning(
+                "Page extraction failed url=%r: %s", url, str(exc).splitlines()[0] if str(exc) else exc
+            )
             return PageContent(url=url, error=str(exc))
 
     async def extract_many(

@@ -1,9 +1,9 @@
 # ResearchMind — Master Implementation Plan
 
 > **Status:** Active implementation
-> **Done:** M0, M1, M2 (188 tests collected, ruff + mypy clean)
-> **Next:** M3 — MVP graph
-> **Last updated:** 2026-10-22
+> **Done:** M0, M1, M2
+> **Current:** M3 — MVP graph: code and offline tests complete; live-API run and seed eval pending (need `GEMINI_API_KEY`)
+> **Last updated:** 2026-10-24
 >
 > This is the single source of truth for the roadmap. `ResearchMind_PRD.md` holds
 > product requirements; `AGENTS.md` holds the rules every contributor/agent follows.
@@ -43,7 +43,7 @@ report in which every citation points to a stored source.
 | Embeddings | Google embeddings, 768-dim | Default `text-embedding-004`; **verify availability**, migrate to `gemini-embedding-001` @ 768 dims if retired |
 | DB / vectors | PostgreSQL 16 + pgvector (HNSW, cosine) | Supabase or local Docker |
 | ORM / migrations | SQLAlchemy 2.0 async (asyncpg), Alembic | |
-| Web search | DuckDuckGo (`duckduckgo-search`, renamed upstream to `ddgs`) | Behind a `SearchProvider` interface from M3; Tavily/Brave/SearXNG as alternatives |
+| Web search | DuckDuckGo via `ddgs` (replaced `duckduckgo-search` in M3 — it silently returned no results) | Behind the `SearchProvider` interface (M3); Tavily/Brave/SearXNG as alternatives |
 | Scraping | httpx + BeautifulSoup4 | SSRF-safe, robots-aware |
 | Background jobs | In-process asyncio tasks | Single API worker assumed until M8 |
 | Realtime | SSE | |
@@ -142,10 +142,49 @@ and its **Done when** criteria met.
 **Runner** — `run_mvp.py "question"` prints the markdown report and usage summary.
 
 **Done when**
-- Unit tests for every node with mocked LLM/tools; one graph test end-to-end with fakes.
-- `run_mvp.py` produces a cited report against live APIs.
-- Seed eval: 100% of citations resolve; ≥ 80% of report sentences cited.
-- A run stops at its budget cap and still returns a report.
+- [x] Unit tests for every node with mocked LLM/tools; one graph test end-to-end with fakes.
+- [x] `run_mvp.py` produces a cited report against live APIs. Gemini free tier + Supabase,
+  2026-10-24: 4 sub-questions, 16 sources, 82/82 passages embedded, 8 sources cited,
+  74/74 citations resolve, 15/15 statements cited, ~100 s; every row checked in the database.
+- [ ] Seed eval: 100% of citations resolve; ≥ 80% of report sentences cited.
+- [x] A run stops at its budget cap and still returns a report (`test_graph.py::TestBudget`).
+
+**As built (2026-10-24)** — where the implementation settled details the plan left open:
+- **Embeddings:** `text-embedding-004` was shut down on 2026-01-14. The default is now
+  `gemini-embedding-001`, requested at `EMBEDDING_DIMENSION` (768) via `output_dimensionality`.
+  Migration `0002` adds `passages.embedding_model`, backfilling existing rows with `text-embedding-004`.
+- **Storage seam:** nodes persist through a `ResearchStore` protocol (`agents/.../storage.py`):
+  `SqlResearchStore` in the backend, `InMemoryResearchStore` for tests, evals, and `--store memory`.
+  `AgentRuntime` moved into the agents package (`runtime.py`); the backend re-exports it.
+- **Fan-out:** `Send` gives one web-researcher branch per sub-question. Branches claim URLs per run,
+  so a page is fetched once and other branches read different candidates. The store de-duplicates
+  by URL or content hash.
+- **Web researcher prompt:** picks which search results to read (labels only); search order is the fallback.
+- **Synthesizer:** retrieval is scoped to the run, not the sub-question, so a page found by one
+  branch serves every sub-question. Statement-level citations, one retry, then uncited statements
+  are dropped. If the budget is spent or the model fails, an extractive report quotes passages
+  instead, so a run always stores a report.
+- **Budget:** `BudgetTracker` wraps the usage sink. Research stops at (1 − `BUDGET_SYNTHESIS_RESERVE`)
+  of either cap; the synthesizer makes no model call once the hard cap is spent.
+- **Not yet:** `overall_confidence` stays `null` until M5's claim scoring (the DB column stores 0.0).
+  `SYNTH_MIN_SIMILARITY` defaults to 0; tune it with the seed eval.
+- **Runner:** `backend/scripts/run_mvp.py` calls `app/services/research_runner.execute_research`,
+  which M4's job runner will reuse.
+- **Search:** `duckduckgo-search` silently returned zero results, so it was replaced by `ddgs`
+  (same API). DuckDuckGo alone also returned nothing from the dev machine, so the default is
+  `SEARCH_BACKEND=auto` (several engines, merged), `SEARCH_REGION=us-en` (`wt-wt` breaks the other
+  engines), and `SEARCH_MAX_ATTEMPTS=2`. Live check with real search and fetching (LLM and
+  embeddings faked): 2 sub-questions → 8 sources, 40 passages in ~10 s, with 403/429 pages
+  replaced by backups.
+- **Free-tier rate limits:** Gemini's free tier caps embeddings at 30k tokens/min; one quick run
+  embeds ~60k. Retries now honour the server's "retry in Ns" (capped by `LLM_MAX_RETRY_DELAY`,
+  60 s), and `AGENT_TIMEOUT` defaults to 240 s so a branch outlives the wait. Before this fix,
+  1 s/2 s retries silently lost ~40% of embeddings in the first live run.
+- **Supabase connection:** `DATABASE_URL` values in Supabase's plain `postgresql://` form are switched
+  to `postgresql+asyncpg://` automatically. Every engine comes from `app.db.session.build_engine`,
+  which disables asyncpg prepared-statement caching on the transaction pooler (port 6543).
+  Alembic escapes `%` in percent-encoded passwords. Settings read `backend/.env` (or the root
+  `.env`) by absolute path, and the test suite never reads either.
 
 ---
 

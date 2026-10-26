@@ -21,11 +21,11 @@
 | Orchestration | LangGraph |
 | LLM (primary) | Gemini 3.1 Flash Lite (`gemini-3.1-flash-lite`) via `google-genai` |
 | LLM (fallback) | Any OpenAI-compatible endpoint (OpenRouter / Groq / local) over `httpx` — satisfies the PRD's two-provider requirement with no extra dependency |
-| Embeddings | Gemini `text-embedding-004` (768d) via `google-genai` |
+| Embeddings | Gemini `gemini-embedding-001` at 768d (`output_dimensionality`) via `google-genai` — `text-embedding-004` was shut down 2026-01-14 |
 | Database | Supabase Cloud (PostgreSQL + pgvector) |
 | Realtime | Supabase Realtime (replaces Redis pub/sub) |
 | Background jobs | In-process asyncio tasks (no Redis/ARQ) |
-| Search | DuckDuckGo (`duckduckgo-search`) |
+| Search | DuckDuckGo via `ddgs` (successor of `duckduckgo-search`, which stopped returning results), behind the `SearchProvider` interface |
 | Page extraction | httpx + BeautifulSoup |
 | Testing | pytest, pytest-asyncio, httpx |
 | Quality | ruff, mypy |
@@ -71,8 +71,22 @@ sides meet in exactly two places:
 
 - **Config** — `backend/app/services/agent_runtime.py` turns `Settings` into an
   `AgentConfig` (a plain frozen dataclass) via `AgentConfig.from_mapping`.
-- **Storage** — the backend injects callables: a `UsageSink` that writes
-  `llm_usage` rows, and a `VectorSearchFn` adapted from `PassageRepository`.
+- **Storage** — the backend injects three things, all built in
+  `agent_runtime.py` and bundled into an `AgentRuntime`
+  (`researchmind_agents/runtime.py`):
+  - a `UsageSink` that writes `llm_usage` rows (the runtime's `BudgetTracker`
+    wraps it, so every call also counts against the run budget);
+  - a `VectorSearchFn` adapted from `PassageRepository`;
+  - a `ResearchStore` (`researchmind_agents/storage.py`) —
+    `SqlResearchStore` in `backend/app/services/research_store.py` — through
+    which nodes save the plan, sources, passages, events, and the report.
+    `InMemoryResearchStore` implements the same protocol for tests and DB-less
+    runs.
 
-Both are keyword-only contracts. When adding a setting, add it to `Settings`,
-`.env.example`, and the matching `AgentConfig` sub-config together.
+All are keyword-only contracts. When adding a setting, add it to `Settings`,
+`.env.example`, and the matching `AgentConfig` sub-config together. Graph state
+holds only JSON-compatible values (dumped Pydantic models), so any LangGraph
+checkpointer can serialise it.
+
+Test doubles for the graph (scripted LLM, fake web, deterministic embeddings)
+live in `researchmind_agents/testing.py` so both test suites can use them.

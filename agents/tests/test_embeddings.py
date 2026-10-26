@@ -71,7 +71,7 @@ class TestSingleEmbeddings:
         assert isinstance(result, EmbeddingResult)
         assert result.ok
         assert len(result.vector) == 768
-        assert result.model == "text-embedding-004"
+        assert result.model == EmbeddingConfig().model
         config = svc._client.models.calls[0]["config"]
         assert config.task_type == "RETRIEVAL_QUERY"
 
@@ -84,9 +84,57 @@ class TestSingleEmbeddings:
         assert config.task_type == "RETRIEVAL_DOCUMENT"
 
     def test_exposes_configured_dimension_and_model(self) -> None:
-        svc = service(dimension=768, model="text-embedding-004")
+        svc = service(dimension=768, model="some-embedding-model")
         assert svc.dimension == 768
-        assert svc.model == "text-embedding-004"
+        assert svc.model == "some-embedding-model"
+
+    async def test_requests_the_configured_dimension(self) -> None:
+        """
+        gemini-embedding-001 returns 3072 dims unless asked otherwise, and the
+        column is vector(768), so every request must carry the dimension.
+        """
+        svc = service(dimension=768)
+        await svc.embed_document("doc")
+        await svc.embed_documents(["a", "b"])
+        await svc.embed_queries(["q"])
+
+        configs = [call["config"] for call in svc._client.models.calls]
+        assert configs
+        assert all(c.output_dimensionality == 768 for c in configs)
+
+    async def test_result_reports_configured_model(self) -> None:
+        svc = service(model="some-embedding-model")
+        result = await svc.embed_document("doc")
+        assert result.model == "some-embedding-model"
+        assert svc._client.models.calls[0]["model"] == "some-embedding-model"
+
+
+class TestQueryBatching:
+    async def test_embed_queries_uses_query_task_type(self) -> None:
+        svc = service()
+        results = await svc.embed_queries(["What is RAG?", "What is HNSW?"])
+
+        assert len(results) == 2
+        assert all(r.ok for r in results)
+        configs = [call["config"] for call in svc._client.models.calls]
+        assert all(c.task_type == "RETRIEVAL_QUERY" for c in configs)
+
+    async def test_embed_queries_batches(self) -> None:
+        svc = service(batch_size=2)
+        results = await svc.embed_queries([f"q{i}" for i in range(5)])
+
+        assert len(results) == 5
+        assert [len(c["contents"]) for c in svc._client.models.calls] == [2, 2, 1]
+
+    async def test_embed_queries_empty_input_makes_no_calls(self) -> None:
+        svc = service()
+        assert await svc.embed_queries([]) == []
+        assert svc._client.models.calls == []
+
+    async def test_embed_documents_keeps_document_task_type(self) -> None:
+        svc = service()
+        await svc.embed_documents(["a"])
+        assert svc._client.models.calls[0]["config"].task_type == "RETRIEVAL_DOCUMENT"
 
 
 class TestBatching:
@@ -203,7 +251,10 @@ class TestLazyClient:
         """
         EmbeddingService(EmbeddingConfig(api_key=""))
 
-    def test_missing_key_surfaces_on_use_not_on_build(self) -> None:
+    def test_missing_key_surfaces_on_use_not_on_build(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # google-genai falls back to these env vars when api_key is empty.
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
         svc = EmbeddingService(EmbeddingConfig(api_key=""))
         with pytest.raises(ValueError, match="API key"):
             _ = svc._client

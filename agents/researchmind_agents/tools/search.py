@@ -1,11 +1,20 @@
 """
-DuckDuckGo web search tool.
+Web search tool.
 
-Includes an in-process TTL cache: the PRD asks for cached search results with a
-configurable TTL (s10), and Redis was dropped from the stack in favour of
-in-process state, so the cache lives here. It also keeps the free DuckDuckGo
-endpoint from being hit repeatedly with the same query during a gap-filling
-loop.
+:class:`SearchTool` is what nodes call. It delegates the actual search to a
+:class:`SearchProvider` — :class:`DDGSProvider` by default — so switching to
+Tavily, Brave, or SearXNG means adding a provider, not touching nodes.
+
+The tool adds what every provider needs:
+
+* an in-process TTL cache — the PRD asks for cached search results with a
+  configurable TTL (s10), and Redis was dropped from the stack in favour of
+  in-process state. It also keeps a free endpoint from being hit repeatedly
+  with the same query;
+* a concurrency cap shared by every caller of the tool instance, so parallel
+  graph branches cannot stampede a rate-limited endpoint;
+* retries: a provider error is retried up to ``max_attempts`` times in total;
+* degrade-don't-crash: errors that outlast the retries become an empty list.
 
 No LLM calls, no DB access.
 """
@@ -17,14 +26,15 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import Protocol
 
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 from researchmind_agents.config import SearchConfig
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SearchResult", "SearchTool"]
+__all__ = ["SearchResult", "SearchProvider", "DDGSProvider", "SearchTool"]
 
 
 @dataclass
@@ -75,9 +85,64 @@ class _TTLCache:
         return len(self._entries)
 
 
+class SearchProvider(Protocol):
+    """A search backend. Raise on failure; :class:`SearchTool` handles degradation."""
+
+    @property
+    def name(self) -> str: ...
+
+    async def search(self, query: str, *, max_results: int) -> list[SearchResult]: ...
+
+
+class DDGSProvider:
+    """
+    Keyless web search via ``ddgs``.
+
+    ``ddgs`` replaced the frozen ``duckduckgo-search`` package, which by late
+    2026 silently returned no results. It is a metasearch library: with
+    ``backend="auto"`` it queries several engines (DuckDuckGo, Bing, Brave,
+    Mojeek, Wikipedia, ...) and merges their results, which survives one
+    engine rate-limiting or blocking far better than DuckDuckGo alone. It
+    raises when no engine returns anything.
+    """
+
+    def __init__(self, config: SearchConfig | None = None) -> None:
+        self._config = config or SearchConfig()
+
+    @property
+    def name(self) -> str:
+        return f"ddgs:{self._config.backend}"
+
+    async def search(self, query: str, *, max_results: int) -> list[SearchResult]:
+        def call() -> list[dict]:
+            with DDGS(timeout=self._config.timeout) as ddgs:
+                return list(
+                    ddgs.text(
+                        query,
+                        region=self._config.region,
+                        safesearch=self._config.safe_search,
+                        max_results=max_results,
+                        backend=self._config.backend,
+                    )
+                )
+
+        raw: list[dict] = await asyncio.to_thread(call)
+        return [
+            SearchResult(
+                title=item.get("title", ""),
+                url=item.get("href", ""),
+                snippet=item.get("body", ""),
+                source=self.name,
+                rank=rank,
+                extra={"raw": item},
+            )
+            for rank, item in enumerate(raw)
+        ]
+
+
 class SearchTool:
     """
-    Async DuckDuckGo search wrapper.
+    Cached, concurrency-capped search over a :class:`SearchProvider`.
 
     Usage::
 
@@ -88,16 +153,27 @@ class SearchTool:
     degrades its sub-question instead of killing the run (PRD s6.3).
     """
 
-    def __init__(self, config: SearchConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: SearchConfig | None = None,
+        provider: SearchProvider | None = None,
+    ) -> None:
         self._config = config or SearchConfig()
+        self._provider: SearchProvider = provider or DDGSProvider(self._config)
         self._cache = _TTLCache(
             self._config.cache_ttl_seconds,
             self._config.cache_max_entries,
         )
+        # Shared by every caller, unlike search_multi's per-call bound.
+        self._semaphore = asyncio.Semaphore(max(1, self._config.max_concurrency))
 
     @property
     def config(self) -> SearchConfig:
         return self._config
+
+    @property
+    def provider(self) -> SearchProvider:
+        return self._provider
 
     @property
     def cache_size(self) -> int:
@@ -116,6 +192,7 @@ class SearchTool:
         """Run a text search and return ranked results, served from cache when fresh."""
         limit = max_results or self._config.max_results
         key = (
+            self._provider.name,
             query.strip().lower(),
             limit,
             self._config.region,
@@ -128,34 +205,20 @@ class SearchTool:
                 logger.debug("Search cache hit query=%r (%d results)", query, len(cached))
                 return cached
 
-        def call() -> list[dict]:
-            with DDGS(timeout=self._config.timeout) as ddgs:
-                return list(
-                    ddgs.text(
-                        query,
-                        region=self._config.region,
-                        safesearch=self._config.safe_search,
-                        max_results=limit,
+        attempts = max(1, self._config.max_attempts)
+        results: list[SearchResult] = []
+        for attempt in range(1, attempts + 1):
+            try:
+                async with self._semaphore:
+                    results = await self._provider.search(query, max_results=limit)
+                break
+            except Exception as exc:  # noqa: BLE001 - degrade, don't crash the run
+                if attempt == attempts:
+                    logger.warning(
+                        "Search failed for query=%r after %d attempt(s): %s", query, attempts, exc
                     )
-                )
-
-        try:
-            raw: list[dict] = await asyncio.to_thread(call)
-        except Exception as exc:  # noqa: BLE001 - degrade, don't crash the run
-            logger.warning("Search failed for query=%r: %s", query, exc)
-            return []
-
-        results = [
-            SearchResult(
-                title=item.get("title", ""),
-                url=item.get("href", ""),
-                snippet=item.get("body", ""),
-                source="duckduckgo",
-                rank=rank,
-                extra={"raw": item},
-            )
-            for rank, item in enumerate(raw)
-        ]
+                    return []
+                logger.info("Search attempt %d failed for query=%r: %s", attempt, query, exc)
 
         if use_cache and results:
             self._cache.set(key, results)

@@ -13,7 +13,10 @@ from researchmind_agents.config import (
     EmbeddingConfig,
     LLMConfig,
     PageExtractConfig,
+    PlannerConfig,
+    ResearchConfig,
     SearchConfig,
+    SynthesizerConfig,
 )
 
 
@@ -95,7 +98,7 @@ class TestMapping:
     def test_carries_embedding_settings(self) -> None:
         config = AgentConfig.from_mapping(
             {
-                "embedding_model": "text-embedding-004",
+                "embedding_model": "some-embedding-model",
                 "embedding_dimension": 1536,
                 "embedding_batch_size": 16,
                 "embedding_max_concurrency": 2,
@@ -103,6 +106,7 @@ class TestMapping:
             }
         )
 
+        assert config.embedding.model == "some-embedding-model"
         assert config.embedding.dimension == 1536
         assert config.embedding.batch_size == 16
         assert config.embedding.max_concurrency == 2
@@ -113,8 +117,10 @@ class TestMapping:
             {
                 "max_sources_per_question": 7,
                 "search_timeout": 12,
-                "search_region": "us-en",
+                "search_region": "uk-en",
                 "search_safe_search": "moderate",
+                "search_backend": "duckduckgo,brave",
+                "search_max_attempts": 4,
                 "search_cache_ttl_seconds": 60,
                 "search_cache_max_entries": 32,
                 "concurrency_cap": 3,
@@ -123,8 +129,10 @@ class TestMapping:
 
         assert config.search.max_results == 7
         assert config.search.timeout == 12
-        assert config.search.region == "us-en"
+        assert config.search.region == "uk-en"
         assert config.search.safe_search == "moderate"
+        assert config.search.backend == "duckduckgo,brave"
+        assert config.search.max_attempts == 4
         assert config.search.cache_ttl_seconds == 60
         assert config.search.cache_max_entries == 32
         # Parallelism is its own knob, not the result count.
@@ -171,6 +179,106 @@ class TestMapping:
     def test_agent_timeout_becomes_llm_request_timeout(self) -> None:
         config = AgentConfig.from_mapping({"agent_timeout": 30})
         assert config.llm.request_timeout == 30
+
+    def test_carries_planner_settings(self) -> None:
+        config = AgentConfig.from_mapping(
+            {
+                "planner_min_sub_questions": 3,
+                "planner_max_sub_questions": 7,
+                "planner_max_queries_per_sub_question": 2,
+            }
+        )
+
+        assert config.planner.min_sub_questions == 3
+        assert config.planner.max_sub_questions == 7
+        assert config.planner.max_queries_per_sub_question == 2
+
+    def test_carries_research_settings(self) -> None:
+        config = AgentConfig.from_mapping(
+            {
+                "research_pages_per_sub_question": 6,
+                "research_max_fetch_attempts": 12,
+                "chunk_size_tokens": 500,
+                "chunk_overlap_tokens": 50,
+                "max_chunks_per_source": 4,
+                "min_source_chars": 250,
+            }
+        )
+
+        assert config.research.pages_per_sub_question == 6
+        assert config.research.max_fetch_attempts == 12
+        assert config.research.chunk_size_tokens == 500
+        assert config.research.chunk_overlap_tokens == 50
+        assert config.research.max_chunks_per_source == 4
+        assert config.research.min_source_chars == 250
+
+    def test_carries_synthesizer_settings(self) -> None:
+        config = AgentConfig.from_mapping(
+            {
+                "synth_top_k_per_sub_question": 3,
+                "synth_max_passages": 12,
+                "synth_max_output_tokens": 2048,
+                "synth_min_similarity": 0.35,
+            }
+        )
+
+        assert config.synthesizer.top_k_per_sub_question == 3
+        assert config.synthesizer.max_passages == 12
+        assert config.synthesizer.max_output_tokens == 2048
+        assert config.synthesizer.min_similarity == 0.35
+
+    def test_carries_budget_reserve(self) -> None:
+        config = AgentConfig.from_mapping({"budget_synthesis_reserve": 0.35})
+        assert config.budget_synthesis_reserve == 0.35
+
+
+class TestM3Defaults:
+    def test_absent_m3_keys_fall_back_to_defaults(self) -> None:
+        config = AgentConfig.from_mapping({})
+
+        assert config.planner == PlannerConfig()
+        assert config.research == ResearchConfig()
+        assert config.synthesizer == SynthesizerConfig()
+        assert config.budget_synthesis_reserve == AgentConfig.budget_synthesis_reserve
+
+    def test_none_m3_values_fall_back_to_defaults(self) -> None:
+        config = AgentConfig.from_mapping(
+            {
+                "planner_max_sub_questions": None,
+                "research_max_fetch_attempts": None,
+                "synth_max_passages": None,
+                "synth_min_similarity": None,
+                "budget_synthesis_reserve": None,
+            }
+        )
+
+        assert config.planner.max_sub_questions == PlannerConfig.max_sub_questions
+        assert config.research.max_fetch_attempts == ResearchConfig.max_fetch_attempts
+        assert config.synthesizer.max_passages == SynthesizerConfig.max_passages
+        assert config.synthesizer.min_similarity == SynthesizerConfig.min_similarity
+        assert config.budget_synthesis_reserve == AgentConfig.budget_synthesis_reserve
+
+    def test_quick_mode_defaults_are_sane(self) -> None:
+        planner = PlannerConfig()
+        research = ResearchConfig()
+
+        assert 1 <= planner.min_sub_questions <= planner.max_sub_questions
+        assert research.chunk_overlap_tokens < research.chunk_size_tokens
+        assert research.max_fetch_attempts >= research.pages_per_sub_question
+        assert 0.0 <= AgentConfig().budget_synthesis_reserve < 1.0
+
+    def test_default_embedding_model_is_not_the_retired_one(self) -> None:
+        """text-embedding-004 was shut down on 2026-01-14."""
+        assert EmbeddingConfig().model != "text-embedding-004"
+
+
+class TestSearchDefaults:
+    def test_default_region_is_a_real_region_code(self) -> None:
+        """'wt-wt' only means something to DuckDuckGo; ddgs's other engines break on it."""
+        config = AgentConfig.from_mapping({})
+        assert config.search.region != "wt-wt"
+        assert config.search.backend == "auto"
+        assert config.search.max_attempts >= 1
 
 
 class TestAllowedContentTypes:

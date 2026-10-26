@@ -34,7 +34,7 @@ def test_metadata_contains_all_11_tables():
 
 
 def test_alembic_migration_script_validity():
-    """Verify that Alembic locates the initial migration revision cleanly."""
+    """Verify that Alembic locates the migration chain cleanly."""
     backend_dir = Path(__file__).parent.parent
     alembic_ini_path = backend_dir / "alembic.ini"
     assert alembic_ini_path.exists(), "alembic.ini missing"
@@ -45,20 +45,25 @@ def test_alembic_migration_script_validity():
     script_dir = ScriptDirectory.from_config(cfg)
     head_rev = script_dir.get_current_head()
 
-    assert head_rev == "0001_initial_schema"
-    rev = script_dir.get_revision("0001_initial_schema")
-    assert rev is not None
-    assert rev.module is not None
-    assert hasattr(rev.module, "upgrade")
-    assert hasattr(rev.module, "downgrade")
+    assert head_rev == "0002_passage_embedding_model"
+    for revision_id in ("0001_initial_schema", "0002_passage_embedding_model"):
+        rev = script_dir.get_revision(revision_id)
+        assert rev is not None
+        assert rev.module is not None
+        assert hasattr(rev.module, "upgrade")
+        assert hasattr(rev.module, "downgrade")
+
+    head = script_dir.get_revision("0002_passage_embedding_model")
+    assert head is not None
+    assert head.down_revision == "0001_initial_schema"
 
 
-def test_offline_sql_generation_targets_postgresql():
+def _render_offline_sql(revision_id: str, direction: str = "upgrade") -> str:
     """
-    Render the migration as SQL without a database.
+    Render one migration step as PostgreSQL SQL without a database.
 
-    This catches dialect-level breakage in the migration script itself (pgvector
-    column types, JSONB defaults) in CI, where no Postgres is available.
+    This catches dialect-level breakage in the migration scripts themselves
+    (pgvector column types, JSONB defaults) in CI, where no Postgres is available.
     """
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
@@ -68,7 +73,8 @@ def test_offline_sql_generation_targets_postgresql():
     cfg.set_main_option("script_location", str(backend_dir / "alembic"))
 
     script_dir = ScriptDirectory.from_config(cfg)
-    revision = script_dir.get_revision("0001_initial_schema")
+    revision = script_dir.get_revision(revision_id)
+    assert revision is not None
 
     statements: list[str] = []
     context = MigrationContext.configure(
@@ -77,13 +83,37 @@ def test_offline_sql_generation_targets_postgresql():
     )
     # Operations.context binds the `alembic.op` proxy the migration module uses.
     with context.begin_transaction(), Operations.context(context):
-        revision.module.upgrade()  # type: ignore[union-attr]
+        getattr(revision.module, direction)()
 
-    sql = "\n".join(statements)
+    return "\n".join(statements)
+
+
+def test_offline_sql_generation_targets_postgresql():
+    sql = _render_offline_sql("0001_initial_schema")
     assert "CREATE EXTENSION IF NOT EXISTS vector" in sql
     assert "CREATE TABLE research_runs" in sql
     assert "vector(768)" in sql.lower()
     assert "USING hnsw" in sql
+
+
+def test_0002_adds_embedding_model_and_drops_the_backfill_default():
+    """Existing rows are backfilled; new rows must name their model."""
+    sql = _render_offline_sql("0002_passage_embedding_model")
+
+    assert "ALTER TABLE passages ADD COLUMN embedding_model VARCHAR(100)" in sql
+    assert "DEFAULT 'text-embedding-004' NOT NULL" in sql
+    assert "ALTER TABLE passages ALTER COLUMN embedding_model DROP DEFAULT" in sql
+
+
+def test_0002_downgrade_drops_the_column():
+    sql = _render_offline_sql("0002_passage_embedding_model", direction="downgrade")
+    assert "ALTER TABLE passages DROP COLUMN embedding_model" in sql
+
+
+def test_passage_model_matches_migration_0002():
+    column = Base.metadata.tables["passages"].c.embedding_model
+    assert column.nullable is False
+    assert column.type.length == 100  # type: ignore[attr-defined]
 
 
 class _Collector:

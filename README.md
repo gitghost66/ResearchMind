@@ -24,8 +24,10 @@ A multi-agent AI research system that decomposes complex questions, researches t
 
 2. **Configure environment:**
    ```bash
-   cp .env.example .env
-   # Edit .env with your Supabase and Gemini API credentials
+   # backend/.env is read wherever you run from (a repo-root .env also works;
+   # backend/.env wins). Only GEMINI_API_KEY is required; see .env.example
+   # for every other setting.
+   cp .env.example backend/.env
    ```
 
 3. **Run the API:**
@@ -39,6 +41,28 @@ A multi-agent AI research system that decomposes complex questions, researches t
    curl http://localhost:8000/health
    # => {"status": "healthy"}
    ```
+
+### Run a research question (M3)
+
+From the repository root, with `GEMINI_API_KEY` set in `backend/.env`:
+
+```bash
+# One question: prints the cited markdown report, usage, and a grounding check
+python backend/scripts/run_mvp.py "Is RAG better than fine-tuning for enterprise QA?"
+
+# Seed eval: runs agents/researchmind_agents/evals/seed.jsonl and writes
+# results to agents/researchmind_agents/evals/results/
+python backend/scripts/run_mvp.py --seed
+```
+
+On Gemini's free tier a run takes about 1.5–2 minutes: embeddings are capped at
+30k tokens per minute, so the run waits out the rate limit (up to
+`LLM_MAX_RETRY_DELAY`) instead of dropping passages.
+
+`--store memory` runs with no database. `--store db` persists the run, sources,
+passages, events, usage, and report to `DATABASE_URL`; apply migrations first
+with `cd backend && alembic upgrade head`. The default, `auto`, uses the
+database when `DATABASE_URL` is set.
 
 ### Run Tests
 ```bash
@@ -81,7 +105,30 @@ computed from `LLM_PRICE_PER_1M_*` or a built-in table, and is `0.0` on free
 tiers rather than estimated.
 
 Embeddings always use `google-genai`, independently of `LLM_PROVIDER`, so an
-OpenAI-compatible LLM can be paired with Gemini embeddings.
+OpenAI-compatible LLM can be paired with Gemini embeddings. The default model is
+`gemini-embedding-001`, asked for 768-dimensional vectors to match the
+`vector(768)` column (`text-embedding-004` was shut down on 2026-01-14).
+
+## Research graph (quick mode)
+
+```
+START → planner ─(one branch per sub-question, in parallel)→ web_researcher → synthesizer → END
+              └────────────(budget spent)────────────────────────────────────↗
+```
+
+- **Planner** — splits the question into 2–5 sub-questions with search queries.
+- **Web researcher** — searches, lets the model pick which results to read,
+  fetches pages, stores each as a source (de-duplicated across branches), then
+  chunks and embeds its text as passages.
+- **Synthesizer** — retrieves the passages most similar to each sub-question
+  and writes the report. The model sees sources as `S1`, `S2`, … and must cite
+  them on every statement; unknown or missing citations get one retry, then the
+  statement is dropped. Markdown is rendered from the validated JSON, so every
+  citation points to a stored source.
+- **Budget** — `MAX_TOKENS_PER_RUN` / `MAX_COST_PER_RUN_USD` are enforced per
+  run. Research stops early to leave `BUDGET_SYNTHESIS_RESERVE` for the report;
+  if the cap is fully spent, the report quotes passages without a model call.
+  A run always ends with a stored report.
 
 ## Architecture
 

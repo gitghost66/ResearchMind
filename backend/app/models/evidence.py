@@ -11,6 +11,7 @@ from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.config import get_settings
 from app.models.base import Base, TimestampMixin, UniversalUUID
 
 if TYPE_CHECKING:
@@ -22,6 +23,11 @@ if TYPE_CHECKING:
 @compiles(Vector, "sqlite")
 def _compile_vector_sqlite(type_, compiler, **kw):  # type: ignore[no-untyped-def]
     return "TEXT"
+
+
+def _current_embedding_model() -> str:
+    """Default for ``Passage.embedding_model``: the configured model."""
+    return get_settings().embedding_model
 
 
 class Source(Base, TimestampMixin):
@@ -82,8 +88,16 @@ class Passage(Base, TimestampMixin):
         index=True,
     )
     text: Mapped[str] = mapped_column(Text, nullable=False)
-    # 768 dimensions for Gemini text-embedding-004
+    # Width must equal Settings.embedding_dimension (768); changing it needs a
+    # new migration.
     embedding = mapped_column(Vector(768), nullable=True)
+    # Vectors from different models are not comparable, so each passage records
+    # the model that embedded it (migration 0002).
+    embedding_model: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        default=_current_embedding_model,
+    )
     chunk_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     source: Mapped["Source"] = relationship("Source", back_populates="passages")

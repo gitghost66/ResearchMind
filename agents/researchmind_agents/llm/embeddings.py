@@ -1,13 +1,17 @@
 """
-Embedding service (Gemini ``text-embedding-004`` by default, 768-dimensional).
+Embedding service (Gemini ``gemini-embedding-001`` by default, 768-dimensional).
 
-Three things matter here beyond calling the API:
+Four things matter here beyond calling the API:
 
 * **Real batching** — one request per ``batch_size`` texts, not one per text
   (PRD s10: "embeddings batched").
 * **Bounded concurrency** — a free tier dies instantly under an unbounded
   ``gather`` over hundreds of texts.
 * **Retries** — a single 429 must not end a research run.
+* **Fixed width** — the configured dimension is always requested, because
+  ``gemini-embedding-001`` returns 3072 dims by default and the column is
+  ``vector(768)``. Truncated vectors are not re-normalised: retrieval uses
+  cosine distance, which ignores vector length.
 
 No HTTP server code, no DB sessions — pure agent-layer logic.
 """
@@ -121,6 +125,13 @@ class EmbeddingService:
 
         Returns one result per input text, in input order.
         """
+        return await self._embed_many(texts, task_type=_TASK_TYPE_RETRIEVAL_DOCUMENT)
+
+    async def embed_queries(self, texts: list[str]) -> list[EmbeddingResult]:
+        """Embed many queries (``RETRIEVAL_QUERY``), batched, in input order."""
+        return await self._embed_many(texts, task_type=_TASK_TYPE_RETRIEVAL_QUERY)
+
+    async def _embed_many(self, texts: list[str], *, task_type: str) -> list[EmbeddingResult]:
         if not texts:
             return []
 
@@ -129,9 +140,7 @@ class EmbeddingService:
 
         async def run(batch: list[str]) -> list[EmbeddingResult]:
             async with self._semaphore:
-                return await self._embed_batch(
-                    batch, task_type=_TASK_TYPE_RETRIEVAL_DOCUMENT
-                )
+                return await self._embed_batch(batch, task_type=task_type)
 
         grouped = await asyncio.gather(*(run(batch) for batch in batches))
 
@@ -160,7 +169,10 @@ class EmbeddingService:
             return self._client.models.embed_content(
                 model=self._config.model,
                 contents=texts,
-                config=genai_types.EmbedContentConfig(task_type=task_type),
+                config=genai_types.EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=self._config.dimension,
+                ),
             )
 
         async def attempt() -> Any:
@@ -171,10 +183,13 @@ class EmbeddingService:
                 attempt,
                 max_attempts=self._config.max_attempts,
                 base_delay=self._config.base_delay,
+                max_delay=self._config.max_retry_delay,
                 description=f"embed:{self._config.model}",
             )
         except Exception as exc:  # noqa: BLE001 - a failed batch degrades, not crashes
-            logger.error("Embedding batch of %d failed: %s", len(texts), exc)
+            logger.error(
+                "Embedding batch of %d failed: %s", len(texts), str(exc).splitlines()[0][:200]
+            )
             return [
                 EmbeddingResult(model=self._config.model, error=str(exc)) for _ in texts
             ]

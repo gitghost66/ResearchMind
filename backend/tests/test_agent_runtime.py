@@ -15,6 +15,8 @@ import pytest
 from researchmind_agents.llm.base import LLMUsage
 from researchmind_agents.llm.client import GeminiProvider
 from researchmind_agents.llm.openai_compatible import OpenAICompatibleProvider
+from researchmind_agents.runtime import AgentRuntime as AgentsRuntime
+from researchmind_agents.storage import InMemoryResearchStore
 from researchmind_agents.tools.vector_search import VectorSearchTool, make_vector_search_fn
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -29,11 +31,13 @@ from app.repositories.research_repository import (
     SubQuestionRepository,
 )
 from app.services.agent_runtime import (
+    AgentRuntime,
     build_agent_config,
     build_agent_runtime,
     make_usage_sink,
     record_usage,
 )
+from app.services.research_store import SqlResearchStore
 
 # ===========================================================================
 # Settings -> AgentConfig
@@ -72,9 +76,73 @@ class TestBuildAgentRuntime:
         runtime = build_agent_runtime(settings=Settings(gemini_api_key="k"))
 
         assert isinstance(runtime.llm, GeminiProvider)
-        assert runtime.vector_search is None
         assert runtime.embeddings.dimension == 768
         assert runtime.search.config.max_results == runtime.config.search.max_results
+        # No database: the in-memory store persists the run and serves search.
+        assert isinstance(runtime.store, InMemoryResearchStore)
+        assert isinstance(runtime.vector_search, VectorSearchTool)
+
+    def test_runtime_class_is_the_agents_one(self) -> None:
+        """The backend re-exports the agents runtime instead of defining its own."""
+        assert AgentRuntime is AgentsRuntime
+
+    def test_session_factory_gives_a_sql_store_and_vector_search(self, async_engine) -> None:
+        factory = async_sessionmaker(bind=async_engine, expire_on_commit=False)
+        runtime = build_agent_runtime(
+            settings=Settings(gemini_api_key="k"), session_factory=factory
+        )
+
+        assert isinstance(runtime.store, SqlResearchStore)
+        assert isinstance(runtime.vector_search, VectorSearchTool)
+
+    def test_explicit_store_wins(self, async_engine) -> None:
+        factory = async_sessionmaker(bind=async_engine, expire_on_commit=False)
+        store = InMemoryResearchStore()
+        runtime = build_agent_runtime(
+            settings=Settings(gemini_api_key="k"), session_factory=factory, store=store
+        )
+        assert runtime.store is store
+
+    def test_budget_limits_follow_settings(self) -> None:
+        runtime = build_agent_runtime(
+            settings=Settings(
+                gemini_api_key="k",
+                max_tokens_per_run=5000,
+                max_cost_per_run_usd=0.25,
+                budget_synthesis_reserve=0.3,
+            )
+        )
+        assert runtime.budget.max_tokens == 5000
+        assert runtime.budget.max_cost_usd == pytest.approx(0.25)
+        assert runtime.budget.synthesis_reserve == pytest.approx(0.3)
+
+    def test_overrides_are_used(self) -> None:
+        from researchmind_agents.llm.embeddings import EmbeddingService
+        from researchmind_agents.tools.page_extract import PageExtractTool
+        from researchmind_agents.tools.search import SearchTool
+
+        embeddings = EmbeddingService()
+        search = SearchTool()
+        page_extract = PageExtractTool()
+        built: list[object] = []
+
+        def llm_factory(config, sink):  # type: ignore[no-untyped-def]
+            provider = GeminiProvider(config, usage_sink=sink, client=object())
+            built.append(provider)
+            return provider
+
+        runtime = build_agent_runtime(
+            settings=Settings(gemini_api_key="k"),
+            llm_factory=llm_factory,
+            embeddings=embeddings,
+            search=search,
+            page_extract=page_extract,
+        )
+
+        assert runtime.llm is built[0]
+        assert runtime.embeddings is embeddings
+        assert runtime.search is search
+        assert runtime.page_extract is page_extract
 
     def test_provider_choice_follows_settings(self) -> None:
         runtime = build_agent_runtime(
@@ -224,6 +292,26 @@ class TestUsageRecording:
         assert rows[0].agent == "web_research"
         assert rows[0].tokens_in == 11
         assert rows[0].tokens_out == 7
+
+        # The same call reached the budget tracker, ahead of the DB sink.
+        assert runtime.budget.calls == 1
+        assert runtime.budget.tokens_used == 18
+        assert runtime.budget.per_agent["web_research"]["tokens_in"] == 11
+        await runtime.aclose()
+
+    async def test_budget_records_even_when_the_db_sink_fails(self, async_engine) -> None:
+        """Usage without a run_id is dropped by the DB sink but still counts."""
+        factory = async_sessionmaker(bind=async_engine, expire_on_commit=False)
+        runtime = build_agent_runtime(
+            settings=Settings(gemini_api_key="k"), session_factory=factory
+        )
+        sink = runtime.llm._usage_sink
+        assert sink is not None
+
+        await sink(LLMUsage(prompt_tokens=40, completion_tokens=10, agent="planner"))
+
+        assert runtime.budget.tokens_used == 50
+        assert runtime.budget.calls == 1
         await runtime.aclose()
 
 

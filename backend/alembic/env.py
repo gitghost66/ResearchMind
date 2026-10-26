@@ -3,11 +3,11 @@ from logging.config import fileConfig
 
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 from app.core.config import get_settings
 from app.db.ddl import ensure_pgvector
+from app.db.session import build_engine
 from app.models import Base
 
 # this is the Alembic Config object, which provides
@@ -24,7 +24,9 @@ target_metadata = Base.metadata
 # Override sqlalchemy.url from Settings if DATABASE_URL is set in environment
 settings = get_settings()
 if settings.database_url:
-    config.set_main_option("sqlalchemy.url", settings.database_url)
+    # Alembic's config uses ConfigParser interpolation, so a percent-encoded
+    # password ("%40" for "@") must be escaped as "%%".
+    config.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
 
 
 def run_migrations_offline() -> None:
@@ -55,11 +57,11 @@ def do_run_migrations(connection: Connection) -> None:
 
 async def run_async_migrations() -> None:
     """Run migrations in 'online' mode with an async engine."""
-    connectable = async_engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
+    url = config.get_main_option("sqlalchemy.url")
+    if not url:
+        raise RuntimeError("No database URL: set DATABASE_URL in backend/.env")
+    # build_engine adds the options Supabase's transaction pooler needs.
+    connectable = build_engine(url, poolclass=pool.NullPool)
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

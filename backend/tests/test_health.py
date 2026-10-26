@@ -3,6 +3,8 @@
 import pytest
 from httpx import AsyncClient
 
+from app.core.config import get_settings
+
 
 @pytest.mark.asyncio
 async def test_health_returns_200(client: AsyncClient):
@@ -26,11 +28,19 @@ async def test_ready_returns_200(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_ready_shows_not_configured_without_env(client: AsyncClient):
+async def test_ready_shows_not_configured_without_env(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+):
     """Without env vars, /ready should show services as not_configured."""
-    response = await client.get("/ready")
+    # conftest already ignores .env files; also drop shell-exported values.
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    get_settings.cache_clear()
+    try:
+        response = await client.get("/ready")
+    finally:
+        get_settings.cache_clear()
     data = response.json()
-    # In test env without .env, these should be not_configured
     assert data["checks"]["database"] == "not_configured"
     assert data["checks"]["gemini"] == "not_configured"
 
