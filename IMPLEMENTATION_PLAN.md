@@ -1,9 +1,10 @@
 # ResearchMind — Master Implementation Plan
 
 > **Status:** Active implementation
-> **Done:** M0, M1, M2
-> **Current:** M3 — MVP graph: code and offline tests complete; live-API run and seed eval pending (need `GEMINI_API_KEY`)
-> **Last updated:** 2026-10-24
+> **Done:** M0, M1, M2, M4 (offline acceptance; live check pending migration 0003 on Supabase)
+> **Open:** M3 seed eval (needs a live `GEMINI_API_KEY` run)
+> **Next:** M5 — specialised agents and verification
+> **Last updated:** 2026-10-27
 >
 > This is the single source of truth for the roadmap. `ResearchMind_PRD.md` holds
 > product requirements; `AGENTS.md` holds the rules every contributor/agent follows.
@@ -45,9 +46,9 @@ report in which every citation points to a stored source.
 | ORM / migrations | SQLAlchemy 2.0 async (asyncpg), Alembic | |
 | Web search | DuckDuckGo via `ddgs` (replaced `duckduckgo-search` in M3 — it silently returned no results) | Behind the `SearchProvider` interface (M3); Tavily/Brave/SearXNG as alternatives |
 | Scraping | httpx + BeautifulSoup4 | SSRF-safe, robots-aware |
-| Background jobs | In-process asyncio tasks | Single API worker assumed until M8 |
-| Realtime | SSE | |
-| Tracing | LangSmith or OpenTelemetry | From M4 |
+| Background jobs | In-process asyncio tasks (`JobRunner`) | Single API worker assumed until M8 |
+| Realtime | SSE from `run_events` (ordered by `seq`) | In-process wake-ups; Postgres LISTEN/NOTIFY in M8 |
+| Tracing | LangSmith via env (opt-in) | Run = trace, node = span (M4); LLM-call spans deferred |
 | Quality | pytest, pytest-asyncio, ruff, mypy | |
 
 ---
@@ -188,7 +189,7 @@ and its **Done when** criteria met.
 
 ---
 
-### 📋 M4 — API, background jobs, durability
+### ✅ M4 — API, background jobs, durability
 
 - Endpoints under `/api/v1/research`:
   - `POST /` → 202 + `run_id`
@@ -196,14 +197,78 @@ and its **Done when** criteria met.
   - `GET /{id}/events` (SSE), `/report`, `/sources`, `/usage`
   - `POST /{id}/cancel`
 - **Job runner** — asyncio task registry with cancellation and a global concurrency cap.
-- **Durability (moved forward from M8)**
-  - LangGraph Postgres checkpointer.
-  - On startup, runs left in `running` are marked `failed` (or resumed once resumption lands).
+- **Durability** — on startup, runs left in `queued`/`running` are marked `failed`.
+  (The LangGraph Postgres checkpointer moved back to M8, with resume: it adds two
+  dependencies and does nothing until a run can resume.)
 - **SSE** — events written to `run_events` and streamed from there, so reconnects replay with `Last-Event-ID`. Single worker for now; document the limit.
 - **Security** — API-key header, per-key/IP rate limiting, input length limits.
-- **Tracing** — one trace per run, one span per node and LLM call.
+- **Tracing** — one trace per run, one span per node. (LLM-call spans need
+  `langsmith` as a declared dependency; deferred.)
 
-**Done when:** a run can be started, streamed, cancelled and fetched over HTTP; killing the server mid-run leaves no run stuck in `running`; API tests cover every endpoint.
+**Done when**
+- [x] A run can be started, streamed, cancelled and fetched over HTTP
+  (`test_api_research.py`; `test_api_server.py` shows events arriving live over a real socket).
+- [x] Killing the server mid-run leaves no run stuck in `running`: graceful shutdown records
+  "interrupted"; the startup sweep catches a hard kill (`TestLifecycle`).
+- [x] API tests cover every endpoint, with the mocked LLM.
+- [ ] Live check against Supabase after `alembic upgrade head` (migration 0003).
+
+**As built (2026-10-27)**
+- **Event order:** migration `0003` adds `run_events.seq` (1, 2, 3, ... per run; unique with
+  `run_id`; existing rows numbered by `(ts, id)`). Timestamps could not order a stream: concurrent
+  branches commit out of timestamp order, so a cursor on `ts` skips late commits.
+  `RunEventRecorder` (`services/run_events.py`) is the only writer: it assigns `seq` and commits
+  under a per-run lock, so commit order equals `seq` order, then wakes listeners in the process.
+  The SSE id is `seq`; `Last-Event-ID` (or `?after=`) resumes exactly after it.
+- **Lifecycle as events:** each status change is a `run_status` event committed in the same
+  transaction as the update. A terminal status is final (`UPDATE … WHERE status IN (…)`), so a
+  late "completed" cannot overwrite "cancelled", and a cancelled queued run never starts.
+  Streams end on the terminal `run_status`; runs from before M4 end on their row's status.
+- **Stream:** reads always go to the database by `seq` — replay, live delivery, and reconnects
+  are one code path. The in-process notifier only saves polling; `SSE_POLL_INTERVAL_SECONDS`
+  catches events written by another process. Each read runs as a shielded task, so a client
+  hanging up mid-read does not tear down a pooled connection. FastAPI's built-in SSE
+  (`fastapi.sse`) sends keep-alive pings; no SSE dependency was added.
+- **Job runner** (`workers/job_runner.py`): `MAX_CONCURRENT_RUNS` execute, up to
+  `MAX_PENDING_RUNS` wait (503 `queue_full` beyond). Interrupts carry a reason: a client cancel
+  records `cancelled`, shutdown records `failed` with "Interrupted: …". The job itself
+  (`ResearchJobs.run`) moves queued → running → completed/failed; `execute_run` never touches status.
+- **Per-run options:** `research_runs.options` (migration `0003`) stores request options apart from
+  `user_context`. `max_sources` becomes `ResearchConfig.max_sources_per_run`, a run-wide cap the
+  web researcher enforces with slots reserved before each store (released on duplicates and
+  failures); a branch that finds the cap reached is `skipped`. Default `MAX_SOURCES_PER_RUN=0` (none).
+- **Progress per step:** derived from events, in the order `researchmind_agents.graph.pipeline_steps`
+  gives: `pending` / `running` / `completed` / `incomplete` / `skipped`. A fan-out step stays
+  `running` until the next step starts, so a branch finishing early does not mark it done.
+- **Shutdown:** uvicorn waits for open connections before running the app's shutdown, and an
+  SSE stream stays open until its run ends — so the Dockerfile and compose file pass
+  `--timeout-graceful-shutdown 5`, after which uvicorn cancels the streams and the lifespan
+  interrupts runs. `stop_grace_period` (30 s) covers both waits.
+- **Failure paths:** any error in the job — including reading the run or marking it running — ends
+  the run `failed`; recording the outcome is retried with backoff. A run interrupted before its
+  task's first step is still recorded (an unstarted coroutine never runs its `except`).
+- **Errors and limits:** one envelope for `ApiError`, FastAPI's HTTP and validation errors, and
+  unhandled exceptions. Settings-dependent limits (question length, context size, `max_sources`)
+  are checked in `ResearchService.validate` and reported in the same `details` shape as Pydantic's.
+  The body limit checks `Content-Length` and counts chunked bodies. The API key is checked
+  first (401/403 before any 503), in constant time; failed attempts count against the client IP.
+  Rate-limit keys are a SHA-256 fingerprint of the key, else the client IP. Cursors and offsets
+  are capped at the INTEGER range. Cancel answers 409 if the run finished before it took effect.
+- **App factory:** `create_app(settings=, services=)`; settings resolve at startup, not import.
+  Without `DATABASE_URL` the app starts and research routes answer 503. `/ready` pings the DB.
+- **Tests:** a file-backed SQLite harness with the agents' fakes (`conftest.py::make_api`). The
+  gate holds runs at the planner's model call: cancelling a run while a branch is mid-query can
+  leave aiosqlite holding a write lock until GC (asyncpg closes the socket, so Postgres is fine).
+- **Known limits:** `max_sources` is an upper bound, not a target. A slot is reserved before the
+  store de-duplicates, so in a narrow race a run can stop one or two sources short of the cap
+  (never over it); fixing that means moving the cap check into `save_source`. Runs started by
+  `run_mvp.py` look orphaned to an API process starting on the same database.
+- **Independent review (2026-10-27):** a separate review pass found nine issues; eight were fixed
+  with tests (shutdown with open streams, failure paths, unstarted-task cancel, cursor bounds,
+  slot release on timeout, cancel-after-completion, auth ordering and throttling, FastAPI floor);
+  the `max_sources` race above is documented instead.
+- **Not yet:** `/graph` (M6); resume from checkpoint and multi-worker fan-out (M8); CORS still
+  permissive (M8).
 
 ---
 

@@ -69,12 +69,51 @@ class Settings(BaseSettings):
     # --- API ---
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    # Clients send it as X-API-Key. Empty disables auth (local development only).
     api_key: str = ""
     debug: bool = False
 
+    # --- API limits ---
+    max_question_chars: int = 2000
+    # Size of user_context once serialised to JSON.
+    max_user_context_bytes: int = 8192
+    # Requests declaring a larger Content-Length are rejected with 413.
+    max_request_body_bytes: int = 65_536
+    # Upper bound for a request's max_sources.
+    max_sources_limit: int = 50
+    # Per API key (or client IP without one), over a sliding window. 0 disables.
+    rate_limit_window_seconds: int = 60
+    rate_limit_requests: int = 120
+    # Run creation is expensive, so it has its own, tighter limit.
+    rate_limit_runs: int = 10
+
+    # --- Background runs ---
+    # Runs executing at once; further runs wait in the queue.
+    max_concurrent_runs: int = 2
+    # Queued plus running; beyond this, new runs get 503.
+    max_pending_runs: int = 20
+    # How long cancel/delete wait for a run to stop before answering.
+    cancel_wait_seconds: float = 10.0
+    # On shutdown, running runs are interrupted and given this long to record it.
+    shutdown_grace_seconds: float = 10.0
+    # On startup, runs left queued/running by a previous process are marked
+    # failed. Assumes one API process; disable when running several.
+    recover_orphaned_runs: bool = True
+
+    # --- Event stream (SSE) ---
+    # Events are pushed as they are written; this is the fallback poll for
+    # events written by another process.
+    sse_poll_interval_seconds: float = 2.0
+    # Reconnect delay suggested to EventSource clients.
+    sse_retry_ms: int = 3000
+
     # --- Research defaults ---
     max_iterations: int = 3
+    # Search results requested per query.
     max_sources_per_question: int = 10
+    # Sources stored per run across all sub-questions (0 = no cap). A request's
+    # max_sources overrides it for that run.
+    max_sources_per_run: int = 0
     default_mode: str = "quick"
     concurrency_cap: int = 4
 
@@ -133,6 +172,14 @@ class Settings(BaseSettings):
     # --- Logging ---
     log_level: str = "INFO"
     log_format: str = "json"
+
+    # --- Tracing (optional) ---
+    # When enabled, these are exported as LANGSMITH_* environment variables at
+    # startup; each run is then one trace with a span per graph node.
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""
+    langsmith_project: str = "researchmind"
+    langsmith_endpoint: str = ""
 
     model_config = {
         "env_file": ENV_FILES,

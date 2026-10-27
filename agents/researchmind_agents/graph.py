@@ -13,6 +13,10 @@ waits for every branch before the synthesizer runs, and the list reducers in
 
 Nodes receive the runtime through closures, so the graph itself holds no
 clients, sessions, or secrets, and its state stays checkpointable.
+
+Tracing: every invocation carries a run name, tags, and ``run_id`` metadata
+(:func:`build_run_config`). With LangSmith enabled through its environment
+variables, a run is one trace and each node is a span under it.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, cast
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
@@ -41,13 +46,26 @@ __all__ = [
     "WEB_RESEARCHER",
     "SYNTHESIZER",
     "build_research_graph",
+    "build_run_config",
     "make_research_router",
+    "pipeline_steps",
     "run_research",
 ]
 
 PLANNER = "planner"
 WEB_RESEARCHER = "web_researcher"
 SYNTHESIZER = "synthesizer"
+
+# Nodes a run passes through, in order, per mode. Node names double as the
+# ``agent`` of the events each node emits, so progress can be read from events.
+_PIPELINE_STEPS: dict[str, tuple[str, ...]] = {
+    "quick": (PLANNER, WEB_RESEARCHER, SYNTHESIZER),
+}
+
+
+def pipeline_steps(mode: str) -> tuple[str, ...]:
+    """The agents a run in *mode* passes through, in order (empty if unknown)."""
+    return _PIPELINE_STEPS.get(mode, ())
 
 
 def make_research_router(runtime: AgentRuntime) -> Callable[[ResearchState], list[Send] | str]:
@@ -123,11 +141,19 @@ async def run_research(
         user_context=user_context,
         max_iterations=1,
     )
-    result = await graph.ainvoke(
-        initial,
-        config={
-            "configurable": {"thread_id": run_id},
-            "max_concurrency": max(1, runtime.config.concurrency_cap),
-        },
-    )
+    result = await graph.ainvoke(initial, config=build_run_config(runtime, run_id=run_id, mode=mode))
     return cast(ResearchState, result)
+
+
+def build_run_config(runtime: AgentRuntime, *, run_id: str, mode: str) -> RunnableConfig:
+    """
+    LangGraph config for one run: checkpoint thread, branch concurrency, and
+    the name, tags, and metadata a tracer groups the run's spans under.
+    """
+    return {
+        "configurable": {"thread_id": run_id},
+        "max_concurrency": max(1, runtime.config.concurrency_cap),
+        "run_name": f"research:{mode}",
+        "tags": ["researchmind", f"mode:{mode}"],
+        "metadata": {"run_id": run_id, "mode": mode},
+    }

@@ -10,4 +10,7 @@ services:
     volumes:
       - ./backend/app:/app/backend/app
       - ./agents/researchmind_agents:/app/agents/researchmind_agents
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --timeout-graceful-shutdown 5
+    # uvicorn's 5s for open streams + SHUTDOWN_GRACE_SECONDS for runs to record
+    # being interrupted, before Docker sends SIGKILL.
+    stop_grace_period: 30s

@@ -524,3 +524,84 @@ class TestMergeCandidates:
     def test_missing_query_and_empty_input(self) -> None:
         assert merge_candidates(["missing"], {}) == []
         assert merge_candidates([], {}) == []
+
+
+# ===========================================================================
+# Run-wide source cap (the API's per-run max_sources)
+# ===========================================================================
+
+
+class TestSourceCap:
+    async def test_cap_limits_stored_sources(self) -> None:
+        runtime = build_fake_runtime(config(max_sources_per_run=2), web=make_web(5))
+
+        update = await run_node(runtime)
+
+        assert len(store_of(runtime).sources) == 2
+        assert runtime.source_slots == 2
+        assert result_of(update)["status"] == "completed"
+        # Only as many pages as the cap allows are read.
+        assert result_of(update)["fetched"] == 2
+
+    async def test_branch_after_the_cap_is_skipped(self) -> None:
+        runtime = build_fake_runtime(config(max_sources_per_run=1), web=make_web(3))
+        runtime.source_slots = 1  # another branch already took the only slot
+
+        update = await run_node(runtime)
+
+        result = result_of(update)
+        assert result["status"] == "skipped"
+        assert result["error"] == "run source limit reached"
+        assert result["fetched"] == 0
+        assert store_of(runtime).sources == {}
+        assert "source_limit_reached" in event_types(update)
+        assert store_of(runtime).sub_questions["sq-1"]["status"] == "skipped"
+
+    async def test_parallel_branches_share_the_cap(self) -> None:
+        runtime = build_fake_runtime(config(max_sources_per_run=3), web=make_web(8))
+        sqs = [SubQuestionItem(id=f"sq-{i}", text=f"Q{i}", queries=["rag"]) for i in range(3)]
+        await runtime.store.save_plan(run_id=RUN_ID, plan={}, sub_questions=sqs)
+        node = make_web_researcher_node(runtime)
+
+        await asyncio.gather(
+            *(
+                node(WebResearchTask(run_id=RUN_ID, question="Q", sub_question=sq.model_dump()))
+                for sq in sqs
+            )
+        )
+
+        assert len(store_of(runtime).sources) == 3
+        assert runtime.source_slots == 3
+
+    async def test_duplicates_give_their_slot_back(self) -> None:
+        runtime = build_fake_runtime(config(max_sources_per_run=5), web=make_web(2))
+        # Both pages already stored by an earlier branch (different source IDs).
+        await run_node(runtime)
+        assert runtime.source_slots == 2
+        runtime.claimed_urls.clear()
+
+        await run_node(runtime, SubQuestionItem(id="sq-2", text="again", queries=["rag"]))
+
+        assert len(store_of(runtime).sources) == 2
+        assert runtime.source_slots == 2
+
+    async def test_a_timeout_while_storing_gives_the_slot_back(self) -> None:
+        class SlowStore(InMemoryResearchStore):
+            async def save_source(self, *, run_id: str, source: Any) -> tuple[str, bool]:
+                await asyncio.sleep(10)
+                raise AssertionError("unreachable")
+
+        cfg = AgentConfig(research=ResearchConfig(max_sources_per_run=3), agent_timeout=0.2)  # type: ignore[arg-type]
+        runtime = build_fake_runtime(cfg, web=make_web(2), store=SlowStore())
+
+        update = await run_node(runtime)
+
+        assert result_of(update)["status"] == "failed"
+        assert runtime.source_slots == 0
+
+    async def test_no_cap_by_default(self) -> None:
+        runtime = build_fake_runtime(web=make_web(4))
+
+        await run_node(runtime)
+
+        assert len(store_of(runtime).sources) == 4

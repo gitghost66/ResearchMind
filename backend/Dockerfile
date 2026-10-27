@@ -20,4 +20,8 @@ WORKDIR /app/backend
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# One worker: research runs are tasks inside this process. SSE streams stay open
+# until their run ends, and uvicorn waits for open connections before it runs
+# the app's shutdown, so the timeout is what lets shutdown interrupt runs (and
+# record them) instead of waiting for them to finish.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-graceful-shutdown", "5"]

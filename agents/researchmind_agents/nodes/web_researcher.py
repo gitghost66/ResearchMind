@@ -13,6 +13,9 @@ Runs once per sub-question, in parallel branches (``Send`` fan-out). Steps:
    hash across branches, and a duplicate's passages are not stored twice;
 5. chunk, embed in one batched call, and store the passages.
 
+``max_sources_per_run`` caps stored sources across all branches. A branch that
+finds the cap already reached stores nothing and is marked ``skipped``.
+
 A source enters the state only after its passages are stored, so everything
 downstream can cite it. A failure marks the sub-question ``failed`` and the run
 continues (PRD s6.3).
@@ -47,7 +50,13 @@ from researchmind_agents.tools.urls import domain_of, is_http_url, normalize_url
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["AGENT", "Candidate", "make_web_researcher_node", "merge_candidates"]
+__all__ = [
+    "AGENT",
+    "Candidate",
+    "make_web_researcher_node",
+    "merge_candidates",
+    "source_slots_left",
+]
 
 AGENT = "web_researcher"
 
@@ -75,6 +84,8 @@ class _Outcome:
     fetched: int = 0
     fetch_failures: int = 0
     duplicates: int = 0
+    # The run-wide source cap stopped this branch from storing a page.
+    capped: bool = False
 
 
 def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
@@ -99,7 +110,7 @@ def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
                 async with asyncio.timeout(runtime.config.agent_timeout):
                     await _research(runtime, run_id, sub_question, log, outcome)
                 if not outcome.passages and not outcome.duplicates:
-                    error = "no usable sources"
+                    error = "run source limit reached" if outcome.capped else "no usable sources"
             except TimeoutError:
                 error = f"timed out after {runtime.config.agent_timeout}s"
                 await log.error(error, sub_question_id=sub_question.id)
@@ -108,7 +119,12 @@ def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
                 await log.error("Web research failed", sub_question_id=sub_question.id, reason=error)
             # Pages another branch already stored still serve this sub-question:
             # retrieval at synthesis searches the whole run.
-            status = "completed" if outcome.passages or outcome.duplicates else "failed"
+            if outcome.passages or outcome.duplicates:
+                status = "completed"
+            elif error == "run source limit reached":
+                status = "skipped"
+            else:
+                status = "failed"
 
         await _set_status(runtime, run_id, sub_question.id, status)
         result = {
@@ -159,9 +175,48 @@ async def _research(
     if not candidates:
         return
 
+    if source_slots_left(runtime) == 0:
+        await _note_cap(runtime, sub_question, log, outcome)
+        return
+
     ordered = await _choose(runtime, run_id, sub_question, candidates, log, outcome)
     pages = await _fetch(runtime, ordered, outcome)
     await _store(runtime, run_id, sub_question, pages, log, outcome)
+
+
+def source_slots_left(runtime: AgentRuntime) -> int | None:
+    """Sources this run may still store, or ``None`` when there is no cap."""
+    cap = runtime.config.research.max_sources_per_run
+    if cap <= 0:
+        return None
+    return max(0, cap - runtime.source_slots)
+
+
+def _reserve_source_slot(runtime: AgentRuntime) -> bool:
+    """
+    Take one slot under the run's source cap.
+
+    Check and increment run with no ``await`` between them, so concurrent
+    branches cannot both take the last slot.
+    """
+    left = source_slots_left(runtime)
+    if left == 0:
+        return False
+    runtime.source_slots += 1
+    return True
+
+
+async def _note_cap(
+    runtime: AgentRuntime, sub_question: SubQuestionItem, log: EventLog, outcome: _Outcome
+) -> None:
+    if outcome.capped:
+        return
+    outcome.capped = True
+    await log.emit(
+        "source_limit_reached",
+        sub_question_id=sub_question.id,
+        limit=runtime.config.research.max_sources_per_run,
+    )
 
 
 def merge_candidates(
@@ -256,6 +311,10 @@ async def _fetch(
     config = runtime.config.research
     want = max(1, config.pages_per_sub_question)
     max_attempts = max(want, config.max_fetch_attempts)
+    # No point reading more pages than the run may still store.
+    left = source_slots_left(runtime)
+    if left is not None:
+        want = min(want, max(1, left))
 
     good: list[tuple[Candidate, PageContent]] = []
     index = 0
@@ -308,11 +367,20 @@ async def _store(
             content_hash=content_hash(page.text),
             sub_question_id=sub_question.id,
         )
+        if not _reserve_source_slot(runtime):
+            await _note_cap(runtime, sub_question, log, outcome)
+            break
+        created = False
         try:
             source_id, created = await runtime.store.save_source(run_id=run_id, source=source)
         except Exception as exc:  # noqa: BLE001 - skip this source only
             await log.error("Failed to store source", url=url, reason=str(exc))
             continue
+        finally:
+            # Only a newly stored source keeps its slot. The finally also
+            # covers a timeout or cancel while waiting on the store.
+            if not created:
+                runtime.source_slots -= 1
         if not created:
             outcome.duplicates += 1
             continue

@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
@@ -48,6 +48,13 @@ class ResearchRun(Base, TimestampMixin):
         nullable=False,
     )
     plan: Mapped[dict[str, Any]] = mapped_column(
+        UniversalJSON,
+        default=dict,
+        nullable=False,
+    )
+    # Per-run settings from the API request, e.g. {"max_sources": 12}
+    # (migration 0003). Kept apart from the client's free-form user_context.
+    options: Mapped[dict[str, Any]] = mapped_column(
         UniversalJSON,
         default=dict,
         nullable=False,
@@ -165,6 +172,7 @@ class RunEvent(Base):
     """
 
     __tablename__ = "run_events"
+    __table_args__ = (Index("ix_run_events_run_id_seq", "run_id", "seq", unique=True),)
 
     id: Mapped[uuid.UUID] = mapped_column(
         UniversalUUID,
@@ -177,6 +185,9 @@ class RunEvent(Base):
         nullable=False,
         index=True,
     )
+    # 1, 2, 3, ... per run in commit order (migration 0003); the SSE event id.
+    # Assigned by app.services.run_events.RunEventRecorder.
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
     ts: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),

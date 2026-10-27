@@ -63,8 +63,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     from app.core.config import get_settings
+    from app.core.tracing import configure_tracing
 
     settings = get_settings()
+    configure_tracing(settings)
     problem = _missing_keys(settings)
     if problem:
         print(f"error: {problem} (set it in {REPO_ROOT / 'backend' / '.env'})", file=sys.stderr)

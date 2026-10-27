@@ -45,17 +45,23 @@ def test_alembic_migration_script_validity():
     script_dir = ScriptDirectory.from_config(cfg)
     head_rev = script_dir.get_current_head()
 
-    assert head_rev == "0002_passage_embedding_model"
-    for revision_id in ("0001_initial_schema", "0002_passage_embedding_model"):
+    assert head_rev == "0003_run_event_seq_and_run_options"
+    chain = (
+        "0001_initial_schema",
+        "0002_passage_embedding_model",
+        "0003_run_event_seq_and_run_options",
+    )
+    for revision_id in chain:
         rev = script_dir.get_revision(revision_id)
         assert rev is not None
         assert rev.module is not None
         assert hasattr(rev.module, "upgrade")
         assert hasattr(rev.module, "downgrade")
 
-    head = script_dir.get_revision("0002_passage_embedding_model")
-    assert head is not None
-    assert head.down_revision == "0001_initial_schema"
+    for parent, child in zip(chain, chain[1:], strict=False):
+        rev = script_dir.get_revision(child)
+        assert rev is not None
+        assert rev.down_revision == parent
 
 
 def _render_offline_sql(revision_id: str, direction: str = "upgrade") -> str:
@@ -108,6 +114,33 @@ def test_0002_adds_embedding_model_and_drops_the_backfill_default():
 def test_0002_downgrade_drops_the_column():
     sql = _render_offline_sql("0002_passage_embedding_model", direction="downgrade")
     assert "ALTER TABLE passages DROP COLUMN embedding_model" in sql
+
+
+def test_0003_numbers_existing_events_then_enforces_order():
+    """Existing events are numbered per run before seq becomes NOT NULL and unique."""
+    sql = _render_offline_sql("0003_run_event_seq_and_run_options")
+
+    assert "ALTER TABLE research_runs ADD COLUMN options JSONB DEFAULT '{}' NOT NULL" in sql
+    assert "ALTER TABLE run_events ADD COLUMN seq INTEGER" in sql
+    assert "row_number() OVER (PARTITION BY run_id ORDER BY ts, id)" in sql
+    assert sql.index("row_number()") < sql.index("ALTER COLUMN seq SET NOT NULL")
+    assert "CREATE UNIQUE INDEX ix_run_events_run_id_seq ON run_events (run_id, seq)" in sql
+
+
+def test_0003_downgrade_drops_both_columns():
+    sql = _render_offline_sql("0003_run_event_seq_and_run_options", direction="downgrade")
+    assert "DROP INDEX ix_run_events_run_id_seq" in sql
+    assert "ALTER TABLE run_events DROP COLUMN seq" in sql
+    assert "ALTER TABLE research_runs DROP COLUMN options" in sql
+
+
+def test_models_match_migration_0003():
+    seq = Base.metadata.tables["run_events"].c.seq
+    assert seq.nullable is False
+    indexes = {ix.name: ix for ix in Base.metadata.tables["run_events"].indexes}
+    assert indexes["ix_run_events_run_id_seq"].unique
+    assert [c.name for c in indexes["ix_run_events_run_id_seq"].columns] == ["run_id", "seq"]
+    assert Base.metadata.tables["research_runs"].c.options.nullable is False
 
 
 def test_passage_model_matches_migration_0002():

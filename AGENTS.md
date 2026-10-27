@@ -23,8 +23,8 @@
 | LLM (fallback) | Any OpenAI-compatible endpoint (OpenRouter / Groq / local) over `httpx` — satisfies the PRD's two-provider requirement with no extra dependency |
 | Embeddings | Gemini `gemini-embedding-001` at 768d (`output_dimensionality`) via `google-genai` — `text-embedding-004` was shut down 2026-01-14 |
 | Database | Supabase Cloud (PostgreSQL + pgvector) |
-| Realtime | Supabase Realtime (replaces Redis pub/sub) |
-| Background jobs | In-process asyncio tasks (no Redis/ARQ) |
+| Realtime | SSE streamed from `run_events` by `seq` (replaces Redis pub/sub; in-process wake-ups, Postgres LISTEN/NOTIFY in M8) |
+| Background jobs | In-process asyncio tasks (`app/workers/job_runner.py`; no Redis/ARQ) — run the API as one worker |
 | Search | DuckDuckGo via `ddgs` (successor of `duckduckgo-search`, which stopped returning results), behind the `SearchProvider` interface |
 | Page extraction | httpx + BeautifulSoup |
 | Testing | pytest, pytest-asyncio, httpx |

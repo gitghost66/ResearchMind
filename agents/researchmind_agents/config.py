@@ -133,6 +133,9 @@ class ResearchConfig:
     max_chunks_per_source: int = 8
     # Pages with less readable text than this are skipped as boilerplate.
     min_source_chars: int = 400
+    # Sources stored per run, across all branches (0 = no cap). The API's
+    # per-run ``max_sources`` arrives here as an override.
+    max_sources_per_run: int = 0
 
 
 @dataclass(frozen=True)
@@ -263,6 +266,7 @@ class AgentConfig:
                 "max_chunks_per_source", ResearchConfig.max_chunks_per_source
             ),
             min_source_chars=pick("min_source_chars", ResearchConfig.min_source_chars),
+            max_sources_per_run=pick("max_sources_per_run", ResearchConfig.max_sources_per_run),
         )
 
         synthesizer = SynthesizerConfig(

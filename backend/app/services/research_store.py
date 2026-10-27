@@ -6,6 +6,9 @@ rule 2). Each method opens its own short-lived session and commits, the same
 pattern as the usage sink: a write the graph has been told succeeded is
 durable, whatever happens to the rest of the run.
 
+Events go through the process-wide :class:`RunEventRecorder`, which numbers
+them and wakes SSE streams; pass the app's recorder so they share its locks.
+
 No prompt text or agent logic lives here.
 """
 
@@ -32,11 +35,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.research import SubQuestion
 from app.repositories.evidence_repository import PassageRepository, SourceRepository
-from app.repositories.research_repository import (
-    ReportRepository,
-    ResearchRunRepository,
-    RunEventRepository,
-)
+from app.repositories.research_repository import ReportRepository, ResearchRunRepository
+from app.services.run_events import RunEventRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +58,14 @@ class SqlResearchStore:
     (a unique constraint or advisory lock) instead.
     """
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        recorder: RunEventRecorder | None = None,
+    ) -> None:
         self._session_factory = session_factory
+        self._recorder = recorder or RunEventRecorder(session_factory)
         self._source_lock = asyncio.Lock()
 
     async def save_plan(
@@ -177,11 +183,9 @@ class SqlResearchStore:
         event_type: str,
         payload: dict[str, Any],
     ) -> None:
-        async with self._session_factory() as session:
-            await RunEventRepository(session).log_event(
-                _uuid(run_id), agent, event_type, dict(payload)
-            )
-            await session.commit()
+        await self._recorder.record(
+            run_id=run_id, agent=agent, event_type=event_type, payload=dict(payload)
+        )
 
     async def list_source_ids(self, *, run_id: str) -> set[str]:
         async with self._session_factory() as session:

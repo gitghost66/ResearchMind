@@ -31,6 +31,7 @@ from app.core.config import Settings, get_settings
 from app.repositories.evidence_repository import PassageRepository
 from app.repositories.research_repository import LLMUsageRepository
 from app.services.research_store import SqlResearchStore, make_session_vector_search_fn
+from app.services.run_events import RunEventRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ def build_agent_runtime(
     session_factory: async_sessionmaker[AsyncSession] | None = None,
     session: AsyncSession | None = None,
     store: ResearchStore | None = None,
+    recorder: RunEventRecorder | None = None,
     llm_factory: LLMFactory | None = None,
     embeddings: EmbeddingService | None = None,
     search: SearchTool | None = None,
@@ -114,6 +116,8 @@ def build_agent_runtime(
       callers that already hold one).
     * Without either, the runtime uses the agents package's in-memory store,
       which also serves vector search — enough for tests and DB-less scripts.
+    * *recorder* is the process-wide event writer the SQL store logs through;
+      one is created if omitted.
 
     *store*, *llm_factory*, and the tool arguments override the defaults; tests
     use them to inject fakes.
@@ -127,7 +131,7 @@ def build_agent_runtime(
         )
 
     if store is None and session_factory is not None:
-        store = SqlResearchStore(session_factory)
+        store = SqlResearchStore(session_factory, recorder=recorder)
 
     vector_search: VectorSearchTool | None = None
     if session is not None:

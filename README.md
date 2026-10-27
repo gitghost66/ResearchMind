@@ -30,17 +30,31 @@ A multi-agent AI research system that decomposes complex questions, researches t
    cp .env.example backend/.env
    ```
 
-3. **Run the API:**
+3. **Apply migrations** (once, and after pulling new ones):
    ```bash
    cd backend
-   uvicorn app.main:app --reload --port 8000
+   alembic upgrade head
    ```
 
-4. **Verify:**
+4. **Run the API** — one worker: research runs execute inside the API process.
+   ```bash
+   cd backend
+   uvicorn app.main:app --reload --port 8000 --timeout-graceful-shutdown 5
+   ```
+   Keep `--timeout-graceful-shutdown`: an open event stream lasts until its run
+   ends, and uvicorn waits for open connections before the app's shutdown runs,
+   so without it stopping the server waits for every streamed run to finish.
+   Without `DATABASE_URL` the API still starts, but the research endpoints
+   answer 503.
+
+5. **Verify:**
    ```bash
    curl http://localhost:8000/health
    # => {"status": "healthy"}
+   curl http://localhost:8000/ready
+   # => {"status": "ready", "checks": {"database": "ok", ...}, "runs": {...}}
    ```
+   Interactive API docs are at http://localhost:8000/docs.
 
 ### Run a research question (M3)
 
@@ -134,17 +148,71 @@ START → planner ─(one branch per sub-question, in parallel)→ web_researche
   if the cap is fully spent, the report quotes passages without a model call.
   A run always ends with a stored report.
 
+## Research API (M4)
+
+Every `/api/v1/research` route needs the `X-API-Key` header (when `API_KEY` is
+set) and counts against a per-key rate limit. Errors always look like
+`{"error": {"code": "...", "message": "...", "details": ...}}`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/v1/research` | Start a run: `{question, mode?, user_context?, max_sources?}` → 202 `{run_id, status, links}` |
+| GET | `/api/v1/research` | List runs, newest first: `?limit=&offset=&status=&mode=` |
+| GET | `/api/v1/research/{id}` | Status, plan, sub-questions, and progress per step |
+| GET | `/api/v1/research/{id}/events` | Server-Sent Events: replay, then live, until the run ends |
+| GET | `/api/v1/research/{id}/report` | Report JSON + markdown (409 while running, 404 if none) |
+| GET | `/api/v1/research/{id}/sources` | Stored sources, with passage counts and whether the report cites them |
+| GET | `/api/v1/research/{id}/usage` | Calls, tokens, cost, and latency — total, per agent, per model |
+| POST | `/api/v1/research/{id}/cancel` | Cancel a queued or running run (409 if it already ended) |
+| DELETE | `/api/v1/research/{id}` | Cancel if active, then delete the run and all its data (204) |
+
+```bash
+KEY="X-API-Key: your-api-key-for-clients"
+RUN=$(curl -s -H "$KEY" -H "Content-Type: application/json"   -d '{"question": "Is RAG better than fine-tuning for enterprise QA?"}'   http://localhost:8000/api/v1/research | python -c "import sys, json; print(json.load(sys.stdin)['run_id'])")
+
+curl -N -H "$KEY" http://localhost:8000/api/v1/research/$RUN/events   # live progress
+curl -s -H "$KEY" http://localhost:8000/api/v1/research/$RUN/report   # once it completes
+curl -s -X POST -H "$KEY" http://localhost:8000/api/v1/research/$RUN/cancel
+```
+
+**Events.** Each SSE event's `event:` is its type and its `id:` is the run's
+event sequence number (`seq`, 1, 2, 3, ...). Types include `run_status`
+(queued → running → completed / failed / cancelled), `agent_started`,
+`agent_finished`, `search_completed`, `source_found`, `report_ready`, and
+`error` (an agent hit a problem; the run continues). The stream closes after
+the terminal `run_status`. To resume after a dropped connection, send
+`Last-Event-ID: <seq>` (browsers' `EventSource` does this itself) or
+`?after=<seq>`. `EventSource` cannot send `X-API-Key`, so a web client should
+use a fetch-based SSE client.
+
+**Limits.** `MAX_QUESTION_CHARS`, `MAX_USER_CONTEXT_BYTES`,
+`MAX_REQUEST_BODY_BYTES` (413), `MAX_SOURCES_LIMIT`; `RATE_LIMIT_REQUESTS` and
+`RATE_LIMIT_RUNS` per `RATE_LIMIT_WINDOW_SECONDS` (429 with `Retry-After`);
+`MAX_CONCURRENT_RUNS` run at once and up to `MAX_PENDING_RUNS` wait (503 beyond).
+
+**Durability.** Runs are asyncio tasks in the API process. On shutdown they
+are recorded as failed ("interrupted") — serve with
+`--timeout-graceful-shutdown` so open event streams do not hold shutdown until
+their runs finish. On startup, any run a crashed process left queued or running
+is marked failed the same way, so no run stays stuck. Resuming interrupted runs
+from a checkpoint is M8. Until then, run a single API worker: the job registry,
+rate limits, and live event wake-ups are per process. For the same reason, do
+not start the API while `run_mvp.py` is running against the same database: the
+startup sweep would mark the script's run failed.
+
+**Tracing.** Set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` to send each
+run to LangSmith as one trace (named `research:<mode>`, tagged with its
+`run_id`) with a span per graph node.
+
 ## Architecture
 
 ```
-Client ──REST/SSE──► FastAPI ──async task──► LangGraph Workflow
-                        │                        │
-                        ▼                        ▼
-                   Supabase (PostgreSQL + pgvector)
-                                                 │
-                                    ┌─────────────┼──────────────┐
-                                    ▼             ▼              ▼
-                              Gemini API    DuckDuckGo    Supabase Realtime
+Client ──REST──► FastAPI ──asyncio task (JobRunner)──► LangGraph workflow
+   ▲               │  ▲                                   │      │
+   │ SSE           │  └──── wake-up on each new event ────┤      ├──► Gemini API
+   └─ run_events ──┘                                      │      └──► web search + pages
+      (seq order)  ▼                                      ▼
+            Supabase PostgreSQL + pgvector  ◄── runs, sources, passages, events, usage, reports
 ```
 
 ## Project Structure
@@ -161,7 +229,8 @@ Client ──REST/SSE──► FastAPI ──async task──► LangGraph Workf
       recording, embeddings, search with TTL cache, SSRF-guarded page extraction,
       vector search)
 - [ ] **M3** — MVP graph (Planner → Web Research → Synthesizer)
-- [ ] **M4** — API and background jobs (full REST API, SSE streaming)
+- [x] **M4** — API and background jobs (REST API, SSE with resume, cancel,
+      in-process job runner, API-key auth, rate limits, startup recovery)
 - [ ] **M5** — Specialized agents and verification
 - [ ] **M6** — Contradictions, loop, evidence graph
 - [ ] **M7** — Evaluation framework

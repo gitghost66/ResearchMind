@@ -1,41 +1,53 @@
 """
-Security utilities — API key validation, rate limiting helpers.
+API-key authentication (PRD s10, MVP).
+
+Clients send ``X-API-Key``. The check is a constant-time comparison against
+``Settings.api_key``; an empty setting disables auth for local development.
+It is a dependency returning the caller's identity, so JWT or user accounts
+can replace it later without touching the routes.
+
+Browsers' ``EventSource`` cannot set headers, so a web client should read the
+SSE stream with a fetch-based client that can.
 """
 
-from fastapi import HTTPException, Security, status
+from __future__ import annotations
+
+import hmac
+
+from fastapi import Request, Security
 from fastapi.security import APIKeyHeader
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
+from app.core.errors import ApiError
 
-_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+API_KEY_HEADER = "X-API-Key"
+
+api_key_header = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
 
 
-async def verify_api_key(
-    api_key: str | None = Security(_api_key_header),
-) -> str:
+def check_api_key(settings: Settings, api_key: str | None) -> str:
     """
-    Validate the API key from the X-API-Key header.
+    Validate *api_key* against the configured one.
 
-    Returns the key if valid; raises 401 if missing, 403 if wrong.
-    For MVP: simple string comparison. Structured so JWT / user accounts
-    can replace this later.
+    Returns the key if valid (``""`` when auth is disabled); raises 401 if it
+    is missing and 403 if it is wrong.
     """
-    settings = get_settings()
-
-    # If no API key is configured, skip auth (dev mode)
     if not settings.api_key:
         return ""
 
-    if api_key is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "missing_api_key", "message": "X-API-Key header required"},
-        )
+    if not api_key:
+        raise ApiError(401, "missing_api_key", f"{API_KEY_HEADER} header required")
 
-    if api_key != settings.api_key:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"code": "invalid_api_key", "message": "Invalid API key"},
-        )
+    if not hmac.compare_digest(api_key.encode(), settings.api_key.encode()):
+        raise ApiError(403, "invalid_api_key", "Invalid API key")
 
     return api_key
+
+
+async def verify_api_key(
+    request: Request,
+    api_key: str | None = Security(api_key_header),
+) -> str:
+    """Dependency form of :func:`check_api_key`, using the app's settings."""
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    return check_api_key(settings, api_key)

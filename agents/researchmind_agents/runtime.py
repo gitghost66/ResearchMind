@@ -46,6 +46,9 @@ class AgentRuntime:
     # claimed URLs and read other candidates instead of fetching a page twice.
     # Per-run scratch only: not checkpointed, so a resumed run may refetch.
     claimed_urls: set[str] = field(default_factory=set)
+    # Sources stored (or being stored) in this run, counted against
+    # ``config.research.max_sources_per_run``. Per-run scratch, like the above.
+    source_slots: int = 0
 
     async def aclose(self) -> None:
         """Release HTTP clients held by the tools."""

@@ -128,10 +128,17 @@ class RunEventRepository(BaseRepository[RunEvent]):
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> RunEvent:
-        """Append an event to the run log."""
+        """
+        Append an event to the run log with the next ``seq``.
+
+        Two writers racing for the same run would pick the same ``seq`` and
+        one would fail the unique index. Concurrent writers go through
+        ``app.services.run_events.RunEventRecorder``, which serialises them.
+        """
         uid = uuid.UUID(str(run_id)) if not isinstance(run_id, uuid.UUID) else run_id
         event = RunEvent(
             run_id=uid,
+            seq=await self.next_seq(uid),
             agent=agent,
             type=event_type,
             payload=payload or {},
@@ -140,10 +147,28 @@ class RunEventRepository(BaseRepository[RunEvent]):
         await self.session.flush()
         return event
 
-    async def list_by_run(self, run_id: uuid.UUID | str) -> Sequence[RunEvent]:
-        """Get all chronological events for a run."""
+    async def next_seq(self, run_id: uuid.UUID | str) -> int:
+        """The ``seq`` the run's next event gets."""
         uid = uuid.UUID(str(run_id)) if not isinstance(run_id, uuid.UUID) else run_id
-        stmt = select(RunEvent).where(RunEvent.run_id == uid).order_by(RunEvent.ts)
+        stmt = select(func.coalesce(func.max(RunEvent.seq), 0)).where(RunEvent.run_id == uid)
+        return int((await self.session.execute(stmt)).scalar_one()) + 1
+
+    async def list_by_run(
+        self,
+        run_id: uuid.UUID | str,
+        *,
+        after_seq: int = 0,
+        limit: int | None = None,
+    ) -> Sequence[RunEvent]:
+        """A run's events in order, optionally only those after *after_seq*."""
+        uid = uuid.UUID(str(run_id)) if not isinstance(run_id, uuid.UUID) else run_id
+        stmt = (
+            select(RunEvent)
+            .where(RunEvent.run_id == uid, RunEvent.seq > after_seq)
+            .order_by(RunEvent.seq)
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
         result = await self.session.execute(stmt)
         return result.scalars().all()
 

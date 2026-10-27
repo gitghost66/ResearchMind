@@ -14,11 +14,17 @@ import json
 from typing import Any
 
 import pytest
+from langchain_core.callbacks import AsyncCallbackHandler
 from langgraph.checkpoint.memory import InMemorySaver
 
 from researchmind_agents.config import AgentConfig, ResearchConfig
 from researchmind_agents.evals.check_grounding import check_grounding
-from researchmind_agents.graph import build_research_graph, run_research
+from researchmind_agents.graph import (
+    build_research_graph,
+    build_run_config,
+    pipeline_steps,
+    run_research,
+)
 from researchmind_agents.runtime import AgentRuntime
 from researchmind_agents.state import new_research_state
 from researchmind_agents.storage import InMemoryResearchStore
@@ -200,3 +206,49 @@ class TestBudget:
         stored = await runtime.store.list_source_ids(run_id="run-cap")
         assert all(c["source_id"] in stored for c in report["sources"])
         assert any("budget" in item for item in report["limitations"])
+
+
+class _ChainRecorder(AsyncCallbackHandler):
+    """Records the name and metadata of every chain (graph and node) a run starts."""
+
+    def __init__(self) -> None:
+        self.starts: list[tuple[str, dict[str, Any], list[str]]] = []
+
+    async def on_chain_start(self, serialized: Any, inputs: Any, **kwargs: Any) -> None:
+        self.starts.append(
+            (kwargs.get("name") or "", dict(kwargs.get("metadata") or {}), list(kwargs.get("tags") or []))
+        )
+
+
+class TestTracing:
+    def test_run_config_names_the_trace_and_tags_the_run(self) -> None:
+        runtime = build_fake_runtime(AgentConfig(concurrency_cap=3))
+        config = build_run_config(runtime, run_id="run-t", mode="quick")
+
+        assert config["configurable"] == {"thread_id": "run-t"}
+        assert config["max_concurrency"] == 3
+        assert config["run_name"] == "research:quick"
+        assert config["metadata"] == {"run_id": "run-t", "mode": "quick"}
+        assert "researchmind" in config["tags"]
+
+    async def test_every_node_span_carries_the_run_id(self) -> None:
+        runtime = build_fake_runtime(web=web())
+        recorder = _ChainRecorder()
+        graph = build_research_graph(runtime)
+        config = build_run_config(runtime, run_id="run-trace", mode="quick")
+        config["callbacks"] = [recorder]
+
+        await graph.ainvoke(new_research_state(run_id="run-trace", question=QUESTION), config=config)
+
+        names = [name for name, _, _ in recorder.starts]
+        assert names[0] == "research:quick"
+        assert {"planner", "web_researcher", "synthesizer"} <= set(names)
+        assert all(meta.get("run_id") == "run-trace" for _, meta, _ in recorder.starts)
+
+
+class TestPipelineSteps:
+    def test_quick_mode_steps_match_the_event_agents(self) -> None:
+        assert pipeline_steps("quick") == ("planner", "web_researcher", "synthesizer")
+
+    def test_unknown_mode_has_no_steps(self) -> None:
+        assert pipeline_steps("nope") == ()

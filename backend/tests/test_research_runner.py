@@ -32,7 +32,7 @@ from app.core.config import Settings
 from app.models.evidence import Passage, Source
 from app.models.research import LLMUsage, Report, ResearchRun, RunEvent, SubQuestion
 from app.services.agent_runtime import build_agent_config
-from app.services.research_runner import execute_research
+from app.services.research_runner import execute_research, settings_for_run
 from app.services.research_store import SqlResearchStore
 
 QUESTION = "RAG versus fine-tuning"
@@ -256,3 +256,65 @@ class TestMemoryRun:
         assert outcome.usage["calls"] >= 2
         assert outcome.seconds >= 0
         assert outcome.state["research_results"]
+
+
+class TestLifecycle:
+    async def test_status_changes_are_events_in_order(
+        self, factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        cfg = settings()
+        outcome = await execute_research(
+            QUESTION,
+            settings=cfg,
+            session_factory=factory,
+            runtime_kwargs=runtime_kwargs(cfg, make_web()),
+        )
+
+        events = sorted(await rows(factory, RunEvent, outcome.run_id), key=lambda e: e.seq)
+        assert [e.seq for e in events] == list(range(1, len(events) + 1))
+        lifecycle = [e.payload["status"] for e in events if e.type == "run_status"]
+        assert lifecycle == ["queued", "running", "completed"]
+        assert events[0].type == events[-1].type == "run_status"
+
+    async def test_failure_is_the_final_event(
+        self, factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        cfg = settings()
+        kwargs = runtime_kwargs(cfg, make_web(), store=_BrokenPlanStore(factory))
+        with pytest.raises(RuntimeError):
+            await execute_research(
+                QUESTION, settings=cfg, session_factory=factory, runtime_kwargs=kwargs
+            )
+
+        async with factory() as session:
+            last = (
+                await session.execute(select(RunEvent).order_by(RunEvent.seq.desc()).limit(1))
+            ).scalar_one()
+        assert last.type == "run_status"
+        assert last.payload["status"] == "failed"
+        assert "database unavailable" in last.payload["error"]
+
+
+class TestRunOptions:
+    def test_max_sources_becomes_the_run_cap(self) -> None:
+        base = settings(max_sources_per_run=0)
+        assert settings_for_run(base, {"max_sources": 7}).max_sources_per_run == 7
+        assert settings_for_run(base, {}) is base
+        assert settings_for_run(base, None) is base
+
+    async def test_options_are_stored_and_applied(
+        self, factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        cfg = settings()
+        outcome = await execute_research(
+            QUESTION,
+            settings=cfg,
+            session_factory=factory,
+            options={"max_sources": 1},
+            runtime_kwargs=runtime_kwargs(cfg, make_web()),
+        )
+
+        assert len(outcome.stored_source_ids) == 1
+        async with factory() as session:
+            run = (await session.execute(select(ResearchRun))).scalars().one()
+        assert run.options == {"max_sources": 1}
