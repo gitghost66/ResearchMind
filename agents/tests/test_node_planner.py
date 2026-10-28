@@ -1,4 +1,4 @@
-"""M3 tests — planner node (mocked LLM, in-memory store)."""
+"""M3/M6 tests — planner node (mocked LLM, in-memory store)."""
 
 from __future__ import annotations
 
@@ -6,10 +6,16 @@ import json
 from typing import Any
 
 from researchmind_agents.config import AgentConfig, PlannerConfig
+from researchmind_agents.modes import MODES
 from researchmind_agents.nodes.planner import fallback_plan, make_planner_node, normalize_plan
-from researchmind_agents.prompts.planner import PROMPT_VERSION
+from researchmind_agents.prompts.planner import GAP_PROMPT_VERSION, PROMPT_VERSION
 from researchmind_agents.runtime import AgentRuntime
-from researchmind_agents.state import PlannedSubQuestion, PlanOutput, new_research_state
+from researchmind_agents.state import (
+    PlannedSubQuestion,
+    PlanOutput,
+    SubQuestionItem,
+    new_research_state,
+)
 from researchmind_agents.storage import InMemoryResearchStore
 from researchmind_agents.testing import ScriptedLLM, build_fake_runtime
 
@@ -220,3 +226,306 @@ class TestFallback:
         self.assert_fallback(update, runtime)
         assert llm_of(runtime).calls == []
         assert "budget" in update["plan"]["fallback_reason"]
+
+
+# ===========================================================================
+# M5: research domains per mode
+# ===========================================================================
+
+
+def planned(*domains: str) -> PlanOutput:
+    return PlanOutput(
+        objective="o",
+        sub_questions=[
+            PlannedSubQuestion(text=f"Question {i}?", queries=[f"q{i}"], domain=domain)
+            for i, domain in enumerate(domains)
+        ],
+    )
+
+
+class TestDomains:
+    def test_quick_mode_sends_everything_to_the_web_researcher(self) -> None:
+        _, items = normalize_plan(
+            planned("web", "technical", "market", "academic"),
+            config=PlannerConfig(max_sub_questions=8),
+            profile=MODES["quick"],
+        )
+        assert [i.domain for i in items] == ["web"] * 4
+
+    def test_deep_mode_keeps_its_domains_and_maps_the_rest_to_web(self) -> None:
+        _, items = normalize_plan(
+            planned("technical", "market", "web", "academic", "astrology", " Market "),
+            config=PlannerConfig(max_sub_questions=8),
+            profile=MODES["deep"],
+        )
+        assert [i.domain for i in items] == ["technical", "market", "web", "web", "web", "market"]
+
+    def test_aliases(self) -> None:
+        _, items = normalize_plan(
+            planned("engineering", "cost", "papers", "general"),
+            config=PlannerConfig(max_sub_questions=8),
+            profile=MODES["academic"],
+        )
+        assert [i.domain for i in items] == ["technical", "market", "academic", "web"]
+
+    def test_a_plan_without_domains_defaults_to_web(self) -> None:
+        plan = PlanOutput.model_validate_json(
+            '{"objective": "o", "sub_questions": [{"text": "t?", "queries": ["q"]}]}'
+        )
+        _, items = normalize_plan(plan, config=PlannerConfig(), profile=MODES["deep"])
+        assert items[0].domain == "web"
+
+    def test_academic_mode_gives_the_first_sub_question_to_the_academic_researcher(self) -> None:
+        _, items = normalize_plan(
+            planned("web", "technical"), config=PlannerConfig(), profile=MODES["academic"]
+        )
+        assert [i.domain for i in items] == ["academic", "technical"]
+
+    def test_academic_mode_keeps_an_academic_assignment(self) -> None:
+        _, items = normalize_plan(
+            planned("web", "academic"), config=PlannerConfig(), profile=MODES["academic"]
+        )
+        assert [i.domain for i in items] == ["web", "academic"]
+
+    def test_fallback_plan_domain_per_mode(self) -> None:
+        assert fallback_plan("Q?")[1][0].domain == "web"
+        assert fallback_plan("Q?", profile=MODES["deep"])[1][0].domain == "web"
+        assert fallback_plan("Q?", profile=MODES["academic"])[1][0].domain == "academic"
+
+    async def test_node_assigns_and_stores_domains(self) -> None:
+        runtime = build_fake_runtime(
+            responses={
+                "PlanOutput": plan_json(
+                    [
+                        {"text": "How fast is RAG?", "queries": ["rag latency"], "domain": "technical"},
+                        {"text": "What does RAG cost?", "queries": ["rag cost"], "domain": "market"},
+                        {"text": "Which papers compare them?", "queries": ["rag papers"], "domain": "academic"},
+                    ]
+                )
+            }
+        )
+
+        update = await run_planner(runtime, mode="deep")
+
+        assert [sq["domain"] for sq in update["sub_questions"]] == ["technical", "market", "web"]
+        stored = store_of(runtime).sub_questions
+        assert [stored[sq["id"]]["domain"] for sq in update["sub_questions"]] == [
+            "technical",
+            "market",
+            "web",
+        ]
+        assert update["events"][-1]["payload"]["domains"] == {"technical": 1, "market": 1, "web": 1}
+
+    async def test_fallback_in_academic_mode_goes_to_the_academic_researcher(self) -> None:
+        runtime = build_fake_runtime(responses={"PlanOutput": RuntimeError("boom")})
+
+        update = await run_planner(runtime, mode="academic")
+
+        assert [sq["domain"] for sq in update["sub_questions"]] == ["academic"]
+
+    async def test_prompt_lists_domains_only_when_the_mode_has_several(self) -> None:
+        quick = build_fake_runtime()
+        await run_planner(quick)
+        quick_prompt = llm_of(quick).calls[0]["prompt"]
+        assert '"domain"' not in quick_prompt
+        assert "technical" not in quick_prompt
+
+        deep = build_fake_runtime()
+        await run_planner(deep, mode="deep")
+        deep_prompt = llm_of(deep).calls[0]["prompt"]
+        assert '"domain"' in deep_prompt
+        assert '"technical"' in deep_prompt and '"market"' in deep_prompt
+        assert '"academic"' not in deep_prompt
+        assert "favours" not in deep_prompt
+
+        academic = build_fake_runtime()
+        await run_planner(academic, mode="academic")
+        academic_prompt = llm_of(academic).calls[0]["prompt"]
+        assert '"academic"' in academic_prompt
+        assert 'favours "academic"' in academic_prompt
+
+    async def test_unknown_mode_is_rejected(self) -> None:
+        runtime = build_fake_runtime()
+        try:
+            await run_planner(runtime, mode="nonsense")
+        except ValueError as exc:
+            assert "not available" in str(exc)
+        else:
+            raise AssertionError("an unknown mode must be rejected")
+
+
+# ===========================================================================
+# M6 — per-mode bounds and gap-filling rounds
+# ===========================================================================
+
+
+class TestModeBounds:
+    async def test_verified_modes_ask_for_four_to_eight(self) -> None:
+        runtime = build_fake_runtime()
+        await run_planner(runtime, mode="deep")
+        prompt = llm_of(runtime).calls_for("PlanOutput")[0]["prompt"]
+        assert "between 4 and 8 items" in prompt
+
+    async def test_quick_mode_keeps_its_own_bounds(self) -> None:
+        runtime = build_fake_runtime()
+        await run_planner(runtime)
+        assert "between 2 and 5 items" in llm_of(runtime).calls_for("PlanOutput")[0]["prompt"]
+
+    def test_the_mode_cap_applies(self) -> None:
+        plan = PlanOutput(
+            objective="o",
+            sub_questions=[PlannedSubQuestion(text=f"Question {i}?", queries=["q"]) for i in range(10)],
+        )
+        config = PlannerConfig(max_sub_questions=3, verified_max_sub_questions=7)
+        assert len(normalize_plan(plan, config=config)[1]) == 3
+        assert len(normalize_plan(plan, config=config, profile=MODES["deep"])[1]) == 7
+
+    async def test_decision_mode_favours_market(self) -> None:
+        runtime = build_fake_runtime()
+        update = await run_planner(runtime, mode="decision")
+        assert "market" in {sq["domain"] for sq in update["sub_questions"]}
+
+
+def gap_json(*items: dict[str, Any]) -> str:
+    return json.dumps({"sub_questions": list(items)})
+
+
+async def run_gap_round(
+    runtime: AgentRuntime,
+    gaps: list[dict[str, Any]],
+    *,
+    existing: list[dict[str, Any]] | None = None,
+    iteration: int = 1,
+    mode: str = "deep",
+) -> dict[str, Any]:
+    """A planner call in round *iteration*, after a first plan of *existing* sub-questions."""
+    items = [
+        SubQuestionItem(id=f"sq{i}", text=sq["text"], queries=sq.get("queries", []), domain="web")
+        for i, sq in enumerate(existing or [{"text": "What does RAG cost?", "queries": ["rag cost"]}])
+    ]
+    await runtime.store.save_plan(run_id="run-1", plan={"objective": "Compare."}, sub_questions=items)
+    state = new_research_state(run_id="run-1", question=QUESTION, mode=mode, max_iterations=3)
+    state["iteration"] = iteration
+    state["plan"] = {"objective": "Compare.", "sub_questions": [i.model_dump() for i in items]}
+    state["sub_questions"] = [i.model_dump() for i in items]
+    state["sufficiency"] = {"status": "needs_more", "decision": "loop", "gaps": gaps}
+    return await make_planner_node(runtime)(state)
+
+
+SQ_GAP = {"label": "G1", "description": "Too little evidence for: What does RAG cost?", "sub_question_id": "sq0"}
+TOPIC_GAP = {"label": "G2", "description": "2026 GPU prices for fine-tuning", "sub_question_id": None}
+
+
+class TestGapRound:
+    async def test_adds_new_sub_questions_for_the_gaps(self) -> None:
+        runtime = build_fake_runtime(
+            responses={
+                "GapPlanOutput": gap_json(
+                    {
+                        "text": "What do vector databases cost per month?",
+                        "queries": ["vector db pricing"],
+                        "gap": "G1",
+                        "domain": "market",
+                    },
+                    {"text": "What do GPUs for fine-tuning cost in 2026?", "queries": ["gpu prices 2026"], "gap": "G2"},
+                )
+            }
+        )
+        update = await run_gap_round(runtime, [SQ_GAP, TOPIC_GAP])
+
+        old, filling, topic = update["sub_questions"]
+        assert old["id"] == "sq0" and old["iteration"] == 0
+        assert (filling["iteration"], filling["parent_id"], filling["domain"]) == (1, "sq0", "market")
+        assert (topic["iteration"], topic["parent_id"]) == (1, None)
+        # Only the new ones are stored as rows; the plan holds them all.
+        store = store_of(runtime)
+        assert {filling["id"], topic["id"]} <= set(store.sub_questions)
+        assert store.iterations["run-1"] == 1
+        assert [sq["id"] for sq in store.plans["run-1"]["sub_questions"]] == [old["id"], filling["id"], topic["id"]]
+        [round_] = update["plan"]["rounds"]
+        assert round_["iteration"] == 1 and round_["added"] == 2
+        assert [c["prompt_version"] for c in update["llm_calls"]] == [GAP_PROMPT_VERSION]
+        assert llm_of(runtime).calls_for("PlanOutput") == [], "a gap round never re-plans"
+
+    async def test_the_prompt_shows_coverage_gaps_and_tried_queries(self) -> None:
+        runtime = build_fake_runtime()
+        await run_gap_round(runtime, [SQ_GAP, TOPIC_GAP])
+        [call] = llm_of(runtime).calls_for("GapPlanOutput")
+        prompt = call["prompt"]
+        assert "What does RAG cost? (NOT covered: 0 verified claims from 0 sites)" in prompt
+        assert "queries tried: rag cost" in prompt
+        assert "[G2] 2026 GPU prices for fine-tuning" in prompt
+        assert "UNTRUSTED_DATA" in prompt, "gap text derived from web pages is fenced"
+
+    async def test_repeats_and_tried_queries_are_dropped(self) -> None:
+        runtime = build_fake_runtime(
+            responses={
+                "GapPlanOutput": gap_json(
+                    {"text": "what does  RAG cost?", "queries": ["x"], "gap": "G1"},
+                    {"text": "What does RAG hosting cost?", "queries": ["RAG COST", "rag hosting price"], "gap": "G1"},
+                    {"text": "What does RAG hosting cost?", "queries": ["dup"], "gap": "G1"},
+                )
+            }
+        )
+        update = await run_gap_round(runtime, [SQ_GAP])
+        new = [sq for sq in update["sub_questions"] if sq["iteration"] == 1]
+        assert [(sq["text"], sq["queries"]) for sq in new] == [("What does RAG hosting cost?", ["rag hosting price"])]
+
+    async def test_at_most_max_gap_sub_questions(self) -> None:
+        runtime = build_fake_runtime(
+            AgentConfig(planner=PlannerConfig(max_gap_sub_questions=1)),
+            responses={
+                "GapPlanOutput": gap_json(
+                    {"text": "A new question?", "queries": ["a"], "gap": "G1"},
+                    {"text": "Another new question?", "queries": ["b"], "gap": "G1"},
+                )
+            },
+        )
+        update = await run_gap_round(runtime, [SQ_GAP])
+        assert len(update["sub_questions"]) == 2
+
+    async def test_an_unknown_gap_label_makes_a_top_level_sub_question(self) -> None:
+        runtime = build_fake_runtime(
+            responses={"GapPlanOutput": gap_json({"text": "Something new?", "queries": ["n"], "gap": "G9"})}
+        )
+        update = await run_gap_round(runtime, [SQ_GAP])
+        assert update["sub_questions"][-1]["parent_id"] is None
+
+    async def test_model_failure_adds_nothing(self) -> None:
+        runtime = build_fake_runtime(responses={"GapPlanOutput": RuntimeError("down")})
+        update = await run_gap_round(runtime, [SQ_GAP])
+        assert [sq["id"] for sq in update["sub_questions"]] == ["sq0"]
+        assert update["plan"]["rounds"][-1]["fallback_reason"].startswith("RuntimeError")
+        assert update["events"][-1]["payload"]["fallback"] is True
+
+    async def test_spent_budget_adds_nothing_without_a_call(self) -> None:
+        runtime = build_fake_runtime(AgentConfig(max_tokens_per_run=10, budget_synthesis_reserve=0.0))
+        runtime.budget.tokens_used = 10
+        update = await run_gap_round(runtime, [SQ_GAP])
+        assert llm_of(runtime).calls_for("GapPlanOutput") == []
+        assert len(update["sub_questions"]) == 1
+
+    async def test_no_gaps_no_call(self) -> None:
+        runtime = build_fake_runtime()
+        update = await run_gap_round(runtime, [])
+        assert llm_of(runtime).calls_for("GapPlanOutput") == []
+        assert update["plan"]["rounds"][-1]["fallback_reason"] == "no gaps to fill"
+
+    async def test_a_store_failure_drops_the_new_sub_questions(self) -> None:
+        runtime = build_fake_runtime(
+            responses={"GapPlanOutput": gap_json({"text": "New?", "queries": ["n"], "gap": "G1"})}
+        )
+        original = runtime.store.save_plan
+        calls = 0
+
+        async def flaky(**kwargs: Any) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("db down")
+            await original(**kwargs)
+
+        runtime.store.save_plan = flaky  # type: ignore[method-assign]
+        update = await run_gap_round(runtime, [SQ_GAP])
+        assert [sq["id"] for sq in update["sub_questions"]] == ["sq0"]
+        assert any(e["type"] == "error" for e in update["events"])

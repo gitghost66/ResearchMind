@@ -31,7 +31,7 @@ where = ["."]
 include = ["researchmind_agents*"]
 
 [tool.setuptools.package-data]
-researchmind_agents = ["evals/*.jsonl"]
+researchmind_agents = ["evals/*.jsonl", "data/*.json"]
 
 [tool.ruff]
 target-version = "py311"

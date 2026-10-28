@@ -6,8 +6,9 @@ Two measures from the M3 plan:
 * **citation resolution** — share of citations (``[S#]`` markers in the
   markdown body, plus labels on every statement in the JSON) that map to a
   listed source whose ID is in the store for that run. Target: 100%.
-* **cited statements** — share of report statements (executive summary and
-  sections) with at least one resolving citation. Target: >= 80%.
+* **cited statements** — share of report statements (executive summary,
+  sections, and a decision-mode recommendation) with at least one resolving
+  citation. Target: >= 80%.
 
 The report is the pipeline's real output and the source IDs come from the
 store, so this checks the whole path end to end, not just the validator.
@@ -109,7 +110,11 @@ def check_grounding(
     # The source list itself uses bare labels, but skip it to be safe.
     body = _SOURCES_HEADING.split(markdown, maxsplit=1)[0]
     citations = _MARKER.findall(body)
-    statements = [*parsed.executive_summary, *(s for sec in parsed.sections for s in sec.statements)]
+    statements = [
+        *parsed.executive_summary,
+        *(s for sec in parsed.sections for s in sec.statements),
+        *parsed.recommendation,
+    ]
     citations += [label for statement in statements for label in statement.citations]
 
     result.citations_total = len(citations)

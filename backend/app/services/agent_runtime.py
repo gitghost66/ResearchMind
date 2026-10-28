@@ -23,6 +23,7 @@ from researchmind_agents.llm.embeddings import EmbeddingService
 from researchmind_agents.runtime import AgentRuntime, LLMFactory, build_runtime
 from researchmind_agents.storage import ResearchStore
 from researchmind_agents.tools.page_extract import PageExtractTool
+from researchmind_agents.tools.scholarly import ScholarlySearchTool
 from researchmind_agents.tools.search import SearchTool
 from researchmind_agents.tools.vector_search import VectorSearchTool, make_vector_search_fn
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -106,6 +107,7 @@ def build_agent_runtime(
     embeddings: EmbeddingService | None = None,
     search: SearchTool | None = None,
     page_extract: PageExtractTool | None = None,
+    scholarly: ScholarlySearchTool | None = None,
 ) -> AgentRuntime:
     """
     Assemble an :class:`AgentRuntime` for one run.
@@ -148,4 +150,5 @@ def build_agent_runtime(
         embeddings=embeddings,
         search=search,
         page_extract=page_extract,
+        scholarly=scholarly,
     )

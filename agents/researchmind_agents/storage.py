@@ -15,6 +15,8 @@ Failure policy, which nodes rely on:
   errors propagate.
 * ``save_source``, ``save_passages`` — errors skip that source; a source that
   was not stored never reaches the report.
+* ``save_claims``, ``save_contradictions`` — errors are logged as an
+  ``error`` event; the records still reach the report from graph state.
 * ``log_event`` — telemetry; errors are logged and swallowed by callers.
 """
 
@@ -24,7 +26,14 @@ import asyncio
 import math
 from typing import Any, Protocol
 
-from researchmind_agents.state import PassageItem, ResearchReport, SourceItem, SubQuestionItem
+from researchmind_agents.state import (
+    ClaimItem,
+    ContradictionItem,
+    PassageItem,
+    ResearchReport,
+    SourceItem,
+    SubQuestionItem,
+)
 from researchmind_agents.tools.vector_search import VectorSearchResult, similarity_from_distance
 
 __all__ = ["ResearchStore", "InMemoryResearchStore"]
@@ -39,8 +48,15 @@ class ResearchStore(Protocol):
         run_id: str,
         plan: dict[str, Any],
         sub_questions: list[SubQuestionItem],
+        iteration: int = 0,
     ) -> None:
-        """Store the plan and create one row per sub-question, using the given IDs."""
+        """
+        Store the plan and create one row per sub-question, using the given IDs.
+
+        *iteration* is the research round (0 first). A gap-filling round
+        passes the whole plan so far, but only its new sub-questions, and the
+        run's iteration is set to it.
+        """
         ...
 
     async def set_sub_question_status(
@@ -70,6 +86,24 @@ class ResearchStore(Protocol):
         embedding_model: str,
     ) -> None:
         """Store passages; ``embeddings[i]`` belongs to ``passages[i]`` (``None`` if it failed)."""
+        ...
+
+    async def save_claims(self, *, run_id: str, claims: list[ClaimItem]) -> None:
+        """
+        Store claims with their verdicts, confidence, and evidence links
+        (``claims`` and ``claim_evidence``). Every evidence passage is a
+        stored passage of the run; one link per (claim, passage).
+        """
+        ...
+
+    async def save_contradictions(
+        self, *, run_id: str, contradictions: list[ContradictionItem]
+    ) -> None:
+        """
+        Store contradictions and their claim links (``contradictions`` and
+        ``contradiction_claims``), using the given IDs. Every claim is a
+        stored claim of the run.
+        """
         ...
 
     async def save_report(self, *, run_id: str, report: ResearchReport, markdown: str) -> str:
@@ -103,6 +137,9 @@ class InMemoryResearchStore:
         self.sub_questions: dict[str, dict[str, Any]] = {}
         self.sources: dict[str, dict[str, Any]] = {}
         self.passages: dict[str, dict[str, Any]] = {}
+        self.claims: dict[str, dict[str, Any]] = {}
+        self.contradictions: dict[str, dict[str, Any]] = {}
+        self.iterations: dict[str, int] = {}
         self.reports: dict[str, dict[str, Any]] = {}
         self.events: list[dict[str, Any]] = []
         self._source_lock = asyncio.Lock()
@@ -113,8 +150,10 @@ class InMemoryResearchStore:
         run_id: str,
         plan: dict[str, Any],
         sub_questions: list[SubQuestionItem],
+        iteration: int = 0,
     ) -> None:
         self.plans[run_id] = dict(plan)
+        self.iterations[run_id] = iteration
         for item in sub_questions:
             self.sub_questions[item.id] = {"run_id": run_id, **item.model_dump()}
 
@@ -162,6 +201,42 @@ class InMemoryResearchStore:
                 "embedding": list(vector) if vector else None,
                 "embedding_model": embedding_model,
             }
+
+    async def save_claims(self, *, run_id: str, claims: list[ClaimItem]) -> None:
+        # Validate everything first, so a bad claim stores nothing (as a
+        # rolled-back transaction would).
+        for claim in claims:
+            if not claim.evidence:
+                raise ValueError(f"claim {claim.id!r} has no evidence")
+            for link in claim.evidence:
+                row = self.passages.get(link.passage_id)
+                if row is None or row["run_id"] != run_id:
+                    raise ValueError(f"unknown passage_id {link.passage_id!r}")
+        for claim in claims:
+            seen: set[str] = set()
+            evidence = []
+            for link in claim.evidence:
+                if link.passage_id not in seen:
+                    seen.add(link.passage_id)
+                    evidence.append(link.model_dump())
+            self.claims[claim.id] = {
+                "run_id": run_id,
+                **claim.model_dump(exclude={"evidence"}),
+                "evidence": evidence,
+            }
+
+    async def save_contradictions(
+        self, *, run_id: str, contradictions: list[ContradictionItem]
+    ) -> None:
+        for item in contradictions:
+            if len(set(item.claim_ids)) < 2:
+                raise ValueError(f"contradiction {item.id!r} needs two claims")
+            for claim_id in item.claim_ids:
+                row = self.claims.get(claim_id)
+                if row is None or row["run_id"] != run_id:
+                    raise ValueError(f"unknown claim_id {claim_id!r}")
+        for item in contradictions:
+            self.contradictions[item.id] = {"run_id": run_id, **item.model_dump()}
 
     async def save_report(self, *, run_id: str, report: ResearchReport, markdown: str) -> str:
         report_id = f"report-{len(self.reports) + 1}"

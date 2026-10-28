@@ -5,6 +5,15 @@ from researchmind_agents.tools.page_extract import (
     PageExtractTool,
     RobotsDisallowedError,
     SSRFError,
+    parse_published_date,
+)
+from researchmind_agents.tools.scholarly import (
+    ArxivProvider,
+    Paper,
+    ScholarlyProvider,
+    ScholarlySearchTool,
+    SemanticScholarProvider,
+    build_scholarly_providers,
 )
 from researchmind_agents.tools.search import SearchResult, SearchTool
 from researchmind_agents.tools.vector_search import (
@@ -22,6 +31,13 @@ __all__ = [
     "PageExtractTool",
     "SSRFError",
     "RobotsDisallowedError",
+    "parse_published_date",
+    "Paper",
+    "ScholarlyProvider",
+    "ArxivProvider",
+    "SemanticScholarProvider",
+    "ScholarlySearchTool",
+    "build_scholarly_providers",
     "VectorSearchResult",
     "VectorSearchTool",
     "VectorSearchFn",

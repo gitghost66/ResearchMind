@@ -195,6 +195,7 @@ class _BrokenPlanStore(SqlResearchStore):
         run_id: str,
         plan: dict[str, Any],
         sub_questions: list[SubQuestionItem],
+        iteration: int = 0,
     ) -> None:
         raise RuntimeError("database unavailable")
 
@@ -227,7 +228,7 @@ class TestFailures:
         with pytest.raises(ValueError, match="not available yet"):
             await execute_research(
                 QUESTION,
-                mode="deep",
+                mode="nonsense",
                 settings=cfg,
                 session_factory=factory,
                 runtime_kwargs=runtime_kwargs(cfg, make_web()),
@@ -236,7 +237,7 @@ class TestFailures:
         async with factory() as session:
             run = (await session.execute(select(ResearchRun))).scalars().one()
         assert run.status == "failed"
-        assert run.mode == "deep"
+        assert run.mode == "nonsense"
         assert "ValueError" in (run.error or "")
 
 

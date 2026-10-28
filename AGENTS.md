@@ -26,6 +26,8 @@
 | Realtime | SSE streamed from `run_events` by `seq` (replaces Redis pub/sub; in-process wake-ups, Postgres LISTEN/NOTIFY in M8) |
 | Background jobs | In-process asyncio tasks (`app/workers/job_runner.py`; no Redis/ARQ) — run the API as one worker |
 | Search | DuckDuckGo via `ddgs` (successor of `duckduckgo-search`, which stopped returning results), behind the `SearchProvider` interface |
+| Academic search | arXiv and Semantic Scholar APIs over `httpx` (stdlib XML/JSON parsing), behind the `ScholarlyProvider` interface |
+| Scoring | Deterministic formulas in `reliability.py`; domain types from the versioned `data/domains.json` (JSON, so no YAML dependency) |
 | Page extraction | httpx + BeautifulSoup |
 | Testing | pytest, pytest-asyncio, httpx |
 | Quality | ruff, mypy |
@@ -53,10 +55,14 @@ researchmind/
 │   ├── pyproject.toml
 │   ├── researchmind_agents/
 │   │   ├── config.py      # AgentConfig — built from backend Settings
+│   │   ├── modes.py       # research modes and the domains each may use
 │   │   ├── state.py       # shared LangGraph state
-│   │   ├── graph.py       # graph assembly
+│   │   ├── graph.py       # graph assembly (per mode)
+│   │   ├── reliability.py # source reliability, claim/report confidence
+│   │   ├── coverage.py    # verified evidence per sub-question (sufficiency, report)
+│   │   ├── data/          # domains.json (versioned domain-type list)
 │   │   ├── nodes/         # agent nodes
-│   │   ├── tools/         # search, page_extract, vector_search
+│   │   ├── tools/         # search, scholarly, page_extract, vector_search, excerpts
 │   │   ├── prompts/       # one file per agent
 │   │   ├── llm/           # provider abstraction
 │   │   └── evals/         # evaluation harness
@@ -79,7 +85,10 @@ sides meet in exactly two places:
   - a `VectorSearchFn` adapted from `PassageRepository`;
   - a `ResearchStore` (`researchmind_agents/storage.py`) —
     `SqlResearchStore` in `backend/app/services/research_store.py` — through
-    which nodes save the plan, sources, passages, events, and the report.
+    which nodes save the plan, sources (with their reliability scores),
+    passages, claims (with evidence links), contradictions (with their claims),
+    events, and the report. Scores are
+    computed in the agents package; the backend only stores them.
     `InMemoryResearchStore` implements the same protocol for tests and DB-less
     runs.
 

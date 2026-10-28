@@ -1,16 +1,29 @@
 """
-Web researcher node: one sub-question -> stored sources and embedded passages.
+Web researchers: one sub-question -> stored, scored sources and embedded passages.
+
+One pipeline serves three researchers, each a :class:`ResearcherProfile`:
+
+* ``web_researcher`` — general web research;
+* ``technical_researcher`` — documentation, specifications, benchmarks;
+* ``market_researcher`` — pricing, adoption, vendor lock-in, talent.
+
+A profile sets the agent name (events and usage are attributed to it), the
+guidance the model gets when choosing what to read, and which source types
+are read first when the model's picks run out. The academic researcher
+(``academic_researcher.py``) reuses the storing half of this module.
 
 Runs once per sub-question, in parallel branches (``Send`` fan-out). Steps:
 
 1. search every planned query; merge results round-robin so each query
-   contributes, dropping duplicate URLs;
+   contributes, dropping duplicate URLs, and type each result's site;
 2. if there are more candidates than pages to read, ask the model which to
-   read (labels only); on failure, or with the budget spent, keep search order;
+   read (labels only); on failure, or with the budget spent, keep search order
+   (specialists move their preferred source types first);
 3. fetch pages, replacing failures from the remaining candidates up to
    ``max_fetch_attempts``;
-4. store each page as a source — the store de-duplicates by URL and content
-   hash across branches, and a duplicate's passages are not stored twice;
+4. score each page's reliability (``reliability.py``) and store it as a
+   source — the store de-duplicates by URL and content hash across branches,
+   and a duplicate's passages are not stored twice;
 5. chunk, embed in one batched call, and store the passages.
 
 ``max_sources_per_run`` caps stored sources across all branches. A branch that
@@ -26,14 +39,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
+from researchmind_agents.modes import MARKET, TECHNICAL, WEB
 from researchmind_agents.nodes.common import EventLog, TaskNode, llm_call_record
 from researchmind_agents.prompts.web_researcher import (
     PROMPT_VERSION,
+    SELECTION_GUIDANCE,
     SYSTEM_PROMPT,
     build_selection_prompt,
+)
+from researchmind_agents.reliability import (
+    PAPER_TYPES,
+    SourceSignals,
+    classify_domain,
+    describes_methodology,
+    source_reliability,
 )
 from researchmind_agents.runtime import AgentRuntime
 from researchmind_agents.state import (
@@ -53,15 +77,62 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AGENT",
     "Candidate",
+    "PageToStore",
+    "ResearchOutcome",
+    "ResearcherProfile",
+    "WEB_PROFILE",
+    "TECHNICAL_PROFILE",
+    "MARKET_PROFILE",
     "make_web_researcher_node",
+    "make_technical_researcher_node",
+    "make_market_researcher_node",
     "merge_candidates",
+    "prefer_types",
+    "score_source",
     "source_slots_left",
+    "store_pages",
 ]
 
 AGENT = "web_researcher"
 
 # Longest snippet shown to the model per search result.
 _SNIPPET_CHARS = 300
+
+
+@dataclass(frozen=True)
+class ResearcherProfile:
+    """What makes one researcher different from another."""
+
+    agent: str
+    domain: str
+    # Source types read first when the model's picks run out; search order
+    # otherwise. Empty keeps search order.
+    preferred_types: tuple[str, ...] = ()
+
+    @property
+    def guidance(self) -> str:
+        return SELECTION_GUIDANCE.get(self.domain, SELECTION_GUIDANCE[WEB])
+
+
+WEB_PROFILE = ResearcherProfile(agent=AGENT, domain=WEB)
+TECHNICAL_PROFILE = ResearcherProfile(
+    agent="technical_researcher",
+    domain=TECHNICAL,
+    preferred_types=(
+        "official_docs",
+        "standards_body",
+        "code_repository",
+        "peer_reviewed",
+        "preprint",
+        "academic",
+        "company_blog",
+    ),
+)
+MARKET_PROFILE = ResearcherProfile(
+    agent="market_researcher",
+    domain=MARKET,
+    preferred_types=("official_docs", "news", "government", "company_blog"),
+)
 
 
 @dataclass(frozen=True)
@@ -73,10 +144,26 @@ class Candidate:
     title: str
     snippet: str
     domain: str
+    # The site's source type (reliability.classify_domain).
+    kind: str = "unknown"
+
+
+@dataclass(frozen=True)
+class PageToStore:
+    """Text to store as a source, from a fetched page or a paper's abstract."""
+
+    url: str
+    title: str
+    text: str
+    # None: classify from the URL.
+    domain_type: str | None = None
+    # ISO 8601 or "".
+    published_at: str = ""
+    citation_count: int | None = None
 
 
 @dataclass
-class _Outcome:
+class ResearchOutcome:
     sources: list[SourceItem] = field(default_factory=list)
     passages: list[PassageItem] = field(default_factory=list)
     llm_calls: list[dict[str, Any]] = field(default_factory=list)
@@ -88,17 +175,52 @@ class _Outcome:
     capped: bool = False
 
 
-def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
+# How a branch does its research, given a fresh outcome to fill in.
+ResearchSteps = Callable[
+    [AgentRuntime, str, SubQuestionItem, EventLog, ResearchOutcome], Awaitable[None]
+]
+
+
+def make_web_researcher_node(
+    runtime: AgentRuntime, profile: ResearcherProfile = WEB_PROFILE
+) -> TaskNode:
+    async def steps(
+        rt: AgentRuntime,
+        run_id: str,
+        sub_question: SubQuestionItem,
+        log: EventLog,
+        outcome: ResearchOutcome,
+    ) -> None:
+        await research_web(rt, run_id, sub_question, log, outcome, profile)
+
+    return make_branch_node(runtime, agent=profile.agent, steps=steps)
+
+
+def make_technical_researcher_node(runtime: AgentRuntime) -> TaskNode:
+    return make_web_researcher_node(runtime, TECHNICAL_PROFILE)
+
+
+def make_market_researcher_node(runtime: AgentRuntime) -> TaskNode:
+    return make_web_researcher_node(runtime, MARKET_PROFILE)
+
+
+def make_branch_node(runtime: AgentRuntime, *, agent: str, steps: ResearchSteps) -> TaskNode:
+    """
+    A research branch: status bookkeeping, budget check, timeout, and error
+    containment around *steps*, plus the events and state update every
+    researcher returns.
+    """
+
     # "state" is the Send payload for this branch, not the full graph state.
-    async def web_researcher_node(state: WebResearchTask) -> dict[str, Any]:
+    async def researcher_node(state: WebResearchTask) -> dict[str, Any]:
         run_id = state["run_id"]
         sub_question = SubQuestionItem.model_validate(state["sub_question"])
-        log = EventLog(runtime, run_id=run_id, agent=AGENT)
+        log = EventLog(runtime, run_id=run_id, agent=agent)
         await log.emit(
             "agent_started", sub_question_id=sub_question.id, sub_question=sub_question.text
         )
 
-        outcome = _Outcome()
+        outcome = ResearchOutcome()
         error: str | None = None
 
         if runtime.budget.research_exhausted:
@@ -108,7 +230,7 @@ def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
             await _set_status(runtime, run_id, sub_question.id, "researching")
             try:
                 async with asyncio.timeout(runtime.config.agent_timeout):
-                    await _research(runtime, run_id, sub_question, log, outcome)
+                    await steps(runtime, run_id, sub_question, log, outcome)
                 if not outcome.passages and not outcome.duplicates:
                     error = "run source limit reached" if outcome.capped else "no usable sources"
             except TimeoutError:
@@ -116,9 +238,9 @@ def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
                 await log.error(error, sub_question_id=sub_question.id)
             except Exception as exc:  # noqa: BLE001 - one sub-question must not end the run
                 error = f"{type(exc).__name__}: {exc}"
-                await log.error("Web research failed", sub_question_id=sub_question.id, reason=error)
+                await log.error("Research failed", sub_question_id=sub_question.id, reason=error)
             # Pages another branch already stored still serve this sub-question:
-            # retrieval at synthesis searches the whole run.
+            # retrieval searches the whole run.
             if outcome.passages or outcome.duplicates:
                 status = "completed"
             elif error == "run source limit reached":
@@ -129,6 +251,7 @@ def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
         await _set_status(runtime, run_id, sub_question.id, status)
         result = {
             "sub_question_id": sub_question.id,
+            "agent": agent,
             "status": status,
             "candidates": outcome.candidates,
             "fetched": outcome.fetched,
@@ -147,7 +270,7 @@ def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
             "llm_calls": outcome.llm_calls,
         }
 
-    return web_researcher_node
+    return researcher_node
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +278,15 @@ def make_web_researcher_node(runtime: AgentRuntime) -> TaskNode:
 # ---------------------------------------------------------------------------
 
 
-async def _research(
+async def research_web(
     runtime: AgentRuntime,
     run_id: str,
     sub_question: SubQuestionItem,
     log: EventLog,
-    outcome: _Outcome,
+    outcome: ResearchOutcome,
+    profile: ResearcherProfile = WEB_PROFILE,
 ) -> None:
+    """Search, choose, fetch, and store pages for one sub-question."""
     queries = sub_question.queries or [sub_question.text]
     results = await runtime.search.search_multi(queries)
     candidates = merge_candidates(queries, results)
@@ -179,9 +304,18 @@ async def _research(
         await _note_cap(runtime, sub_question, log, outcome)
         return
 
-    ordered = await _choose(runtime, run_id, sub_question, candidates, log, outcome)
-    pages = await _fetch(runtime, ordered, outcome)
-    await _store(runtime, run_id, sub_question, pages, log, outcome)
+    ordered = await _choose(runtime, run_id, sub_question, candidates, log, outcome, profile)
+    fetched = await _fetch(runtime, ordered, outcome)
+    pages = [
+        PageToStore(
+            url=page.final_url or candidate.url,
+            title=page.title or candidate.title,
+            text=page.text,
+            published_at=page.published_at,
+        )
+        for candidate, page in fetched
+    ]
+    await store_pages(runtime, run_id, sub_question, pages, log, outcome)
 
 
 def source_slots_left(runtime: AgentRuntime) -> int | None:
@@ -207,7 +341,7 @@ def _reserve_source_slot(runtime: AgentRuntime) -> bool:
 
 
 async def _note_cap(
-    runtime: AgentRuntime, sub_question: SubQuestionItem, log: EventLog, outcome: _Outcome
+    runtime: AgentRuntime, sub_question: SubQuestionItem, log: EventLog, outcome: ResearchOutcome
 ) -> None:
     if outcome.capped:
         return
@@ -250,9 +384,18 @@ def merge_candidates(
                     title=" ".join(result.title.split()),
                     snippet=" ".join(result.snippet.split())[:_SNIPPET_CHARS],
                     domain=domain_of(result.url),
+                    kind=classify_domain(result.url),
                 )
             )
     return merged
+
+
+def prefer_types(candidates: list[Candidate], preferred: tuple[str, ...]) -> list[Candidate]:
+    """Candidates of the preferred types first (in that order), the rest after; stable."""
+    if not preferred:
+        return list(candidates)
+    rank = {kind: index for index, kind in enumerate(preferred)}
+    return sorted(candidates, key=lambda c: rank.get(c.kind, len(preferred)))
 
 
 async def _choose(
@@ -261,24 +404,27 @@ async def _choose(
     sub_question: SubQuestionItem,
     candidates: list[Candidate],
     log: EventLog,
-    outcome: _Outcome,
+    outcome: ResearchOutcome,
+    profile: ResearcherProfile,
 ) -> list[Candidate]:
     """Order candidates for fetching: the model's picks first, the rest as backups."""
     want = max(1, runtime.config.research.pages_per_sub_question)
+    backups = prefer_types(candidates, profile.preferred_types)
     if len(candidates) <= want or runtime.budget.research_exhausted:
-        return candidates
+        return backups
 
     prompt = build_selection_prompt(
         sub_question=sub_question.text,
-        results=[(c.label, c.title, c.domain, c.snippet) for c in candidates],
+        results=[(c.label, c.title, c.domain, c.snippet, c.kind) for c in candidates],
         max_selected=want,
+        guidance=profile.guidance,
     )
     try:
         response = await runtime.llm.generate_structured(
             prompt,
             SourceSelection,
             system=SYSTEM_PROMPT,
-            agent=AGENT,
+            agent=profile.agent,
             run_id=run_id,
         )
     except Exception as exc:  # noqa: BLE001 - fall back to search order
@@ -287,7 +433,7 @@ async def _choose(
             sub_question_id=sub_question.id,
             reason=f"{type(exc).__name__}: {exc}",
         )
-        return candidates
+        return backups
 
     outcome.llm_calls.append(llm_call_record(response.usage, prompt_version=PROMPT_VERSION))
     by_label = {c.label: c for c in candidates}
@@ -298,14 +444,14 @@ async def _choose(
             chosen.append(candidate)
     chosen = chosen[:want]
     if not chosen:
-        return candidates
-    return chosen + [c for c in candidates if c not in chosen]
+        return backups
+    return chosen + [c for c in backups if c not in chosen]
 
 
 async def _fetch(
     runtime: AgentRuntime,
     ordered: list[Candidate],
-    outcome: _Outcome,
+    outcome: ResearchOutcome,
 ) -> list[tuple[Candidate, PageContent]]:
     """Fetch until enough pages have usable text or the attempt cap is hit."""
     config = runtime.config.research
@@ -345,27 +491,50 @@ async def _fetch(
     return good
 
 
-async def _store(
+# ---------------------------------------------------------------------------
+# Storing (shared with the academic researcher)
+# ---------------------------------------------------------------------------
+
+
+def score_source(runtime: AgentRuntime, page: PageToStore) -> tuple[str, float, str | None]:
+    """``(domain_type, reliability_score, published_at)`` for a page about to be stored."""
+    domain_type = page.domain_type or classify_domain(page.url)
+    published = _parse_iso(page.published_at)
+    signals = SourceSignals(
+        domain_type=domain_type,
+        published_at=published,
+        citation_count=page.citation_count,
+        has_methodology=domain_type in PAPER_TYPES and describes_methodology(page.text),
+    )
+    score = source_reliability(signals, now=runtime.now(), config=runtime.config.scoring)
+    return domain_type, score, published.isoformat() if published else None
+
+
+async def store_pages(
     runtime: AgentRuntime,
     run_id: str,
     sub_question: SubQuestionItem,
-    pages: list[tuple[Candidate, PageContent]],
+    pages: list[PageToStore],
     log: EventLog,
-    outcome: _Outcome,
+    outcome: ResearchOutcome,
 ) -> None:
     """Store sources, then embed all new chunks in one call, then store passages."""
     config = runtime.config.research
     new_sources: list[tuple[SourceItem, list[str]]] = []
 
-    for candidate, page in pages:
-        url = normalize_url(page.final_url or candidate.url)
+    for page in pages:
+        url = normalize_url(page.url)
+        domain_type, reliability, published_at = score_source(runtime, page)
         source = SourceItem(
             id=str(uuid.uuid4()),
             url=url,
-            title=" ".join((page.title or candidate.title).split()),
+            title=" ".join(page.title.split()),
             domain=domain_of(url),
             content_hash=content_hash(page.text),
             sub_question_id=sub_question.id,
+            domain_type=domain_type,
+            reliability_score=reliability,
+            published_at=published_at,
         )
         if not _reserve_source_slot(runtime):
             await _note_cap(runtime, sub_question, log, outcome)
@@ -441,8 +610,20 @@ async def _store(
             source_id=source.id,
             url=source.url,
             title=source.title,
+            domain_type=source.domain_type,
+            reliability_score=source.reliability_score,
             passages=len(passages),
         )
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 async def _set_status(runtime: AgentRuntime, run_id: str, sub_question_id: str, status: str) -> None:

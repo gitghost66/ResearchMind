@@ -18,6 +18,7 @@ from fastapi.sse import EventSourceResponse, ServerSentEvent
 
 from app.container import AppServices
 from app.core.deps import get_services, limit_requests, limit_run_creation
+from app.schemas.graph import EvidenceGraph
 from app.schemas.research import (
     CancelResponse,
     ErrorEnvelope,
@@ -135,6 +136,25 @@ async def get_report(run_id: uuid.UUID, services: ServicesDep) -> ReportResponse
     async with services.session_factory() as session:
         run = await services.research.get(session, run_id)
         return await services.research.report(session, run)
+
+
+@router.get(
+    "/{run_id}/graph",
+    summary="Evidence graph: question, sub-questions, claims, passages, sources",
+    description=(
+        "Nodes `{id, type, label, meta}` and edges `{id, from, to, type, meta}` for a "
+        "React Flow view. Edge types: `decomposes` (question to sub-questions, and "
+        "sub-questions to their claims), `supports` / `contradicts` (passage to claim, and "
+        "claim to claim for a detected contradiction), and `cites` (passage to its source). "
+        "Claim nodes carry `verdict` and `confidence`. Built from what the run has stored, "
+        "so it is available while the run is in progress."
+    ),
+    response_model_by_alias=True,
+)
+async def get_graph(run_id: uuid.UUID, services: ServicesDep) -> EvidenceGraph:
+    async with services.session_factory() as session:
+        run = await services.research.get(session, run_id)
+        return await services.research.graph(session, run)
 
 
 @router.get("/{run_id}/sources", summary="Sources the run stored")

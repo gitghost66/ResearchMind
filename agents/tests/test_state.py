@@ -16,6 +16,13 @@ from typing import Any
 from researchmind_agents.state import (
     SUPPORTED_MODES,
     CitationItem,
+    ClaimCheck,
+    ClaimExtractionOutput,
+    EvidenceJudgement,
+    ExtractedClaim,
+    FactCheckOutput,
+    FindingSection,
+    FindingStatement,
     PassageItem,
     PlannedSubQuestion,
     PlanOutput,
@@ -27,6 +34,7 @@ from researchmind_agents.state import (
     SourceItem,
     SourceSelection,
     SubQuestionItem,
+    VerifiedReportOutput,
     new_research_state,
 )
 
@@ -136,15 +144,49 @@ class TestLLMSchemas:
     def test_llm_output_fields_are_required(self) -> None:
         """Required-only schemas keep the provider's JSON schema unambiguous."""
         for schema in (
-            PlannedSubQuestion,
             PlanOutput,
             SourceSelection,
             ReportStatement,
             ReportSection,
             ReportOutput,
+            ExtractedClaim,
+            ClaimExtractionOutput,
+            EvidenceJudgement,
+            ClaimCheck,
+            FactCheckOutput,
+            FindingStatement,
+            FindingSection,
+            VerifiedReportOutput,
         ):
             json_schema = schema.model_json_schema()
             assert set(json_schema.get("required", [])) == set(json_schema["properties"]), schema
+
+    def test_sub_question_domain_is_the_one_optional_field(self) -> None:
+        """A plan without domains (quick mode, or a model that omits them) still validates."""
+        json_schema = PlannedSubQuestion.model_json_schema()
+        assert set(json_schema["properties"]) - set(json_schema["required"]) == {"domain"}
+        assert PlannedSubQuestion(text="t", queries=["q"]).domain == "web"
+
+    def test_statement_claims_are_hidden_from_the_model(self) -> None:
+        """Code sets a statement's claim labels; the model's schema never offers them."""
+        assert "claims" not in ReportStatement.model_json_schema()["properties"]
+        assert "claims" not in json.dumps(ReportOutput.model_json_schema())
+        statement = ReportStatement(text="t", citations=["S1"], claims=["C2"])
+        assert statement.model_dump()["claims"] == ["C2"]
+
+    def test_verdicts_and_stances_are_enums_for_the_model(self) -> None:
+        defs = FactCheckOutput.model_json_schema()["$defs"]
+        assert defs["ClaimCheck"]["properties"]["verdict"]["enum"] == [
+            "supported",
+            "weak",
+            "unsupported",
+            "mixed",
+        ]
+        assert defs["EvidenceJudgement"]["properties"]["stance"]["enum"] == [
+            "supports",
+            "contradicts",
+            "neutral",
+        ]
 
     def test_plan_output_parses(self) -> None:
         plan = PlanOutput.model_validate_json(
@@ -153,5 +195,37 @@ class TestLLMSchemas:
         assert plan.sub_questions[0].queries == ["q"]
 
 
-def test_supported_modes_is_quick_only() -> None:
-    assert frozenset({"quick"}) == SUPPORTED_MODES
+def test_supported_modes() -> None:
+    """M5 adds the verified modes, M6 decision mode."""
+    assert frozenset({"quick", "deep", "academic", "decision"}) == SUPPORTED_MODES
+
+
+
+def test_m6_state_fields_start_empty() -> None:
+    from researchmind_agents.state import new_research_state
+
+    state = new_research_state(run_id="r", question="q", mode="deep", max_iterations=3)
+    assert state["contradictions"] == []
+    assert state["extracted_passage_ids"] == []
+    assert state["sufficiency"] == {}
+    assert state["max_iterations"] == 3
+
+
+def test_m6_schemas_keep_llm_fields_required() -> None:
+    from researchmind_agents.state import (
+        ContradictionOutput,
+        DecisionReportOutput,
+        GapPlanOutput,
+        ReportOutput,
+        SufficiencyOutput,
+    )
+
+    assert set(SufficiencyOutput.model_json_schema()["required"]) == {"sufficient", "gaps", "reason"}
+    contradiction = ContradictionOutput.model_json_schema()["$defs"]["DetectedContradiction"]
+    assert set(contradiction["required"]) == {"claims", "likely_cause", "explanation"}
+    assert "recommendation" in DecisionReportOutput.model_json_schema()["required"]
+    # Hidden from quick mode's schema; set by code in decision mode.
+    assert "recommendation" not in ReportOutput.model_json_schema()["properties"]
+    # Optional, like domain: a gap sub-question without one is still researched.
+    gap = GapPlanOutput.model_json_schema()["$defs"]["GapSubQuestion"]
+    assert "gap" not in gap.get("required", [])

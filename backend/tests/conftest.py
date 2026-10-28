@@ -16,6 +16,7 @@ from researchmind_agents.testing import (
     FakeWeb,
     ScriptedLLM,
     fake_embedding_service,
+    fake_scholarly_tool,
 )
 from researchmind_agents.tools.search import SearchTool
 from sqlalchemy import event
@@ -234,6 +235,8 @@ async def _build_harness(tmp_path: Any, index: int, **overrides: Any) -> ApiHarn
             "embeddings": fake_embedding_service(config.embedding),
             "search": SearchTool(config.search, provider=FakeSearchProvider(web)),
             "page_extract": FakePageExtract(web),
+            # Never reach arXiv or Semantic Scholar from tests.
+            "scholarly": fake_scholarly_tool(config),
         }
 
     services = build_services(settings, factory, runtime_kwargs=runtime_kwargs)

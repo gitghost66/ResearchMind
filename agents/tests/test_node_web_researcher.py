@@ -9,11 +9,22 @@ scripted LLM, and the in-memory store.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 from researchmind_agents.config import AgentConfig, ResearchConfig
-from researchmind_agents.nodes.web_researcher import make_web_researcher_node, merge_candidates
+from researchmind_agents.nodes.web_researcher import (
+    MARKET_PROFILE,
+    TECHNICAL_PROFILE,
+    Candidate,
+    make_market_researcher_node,
+    make_technical_researcher_node,
+    make_web_researcher_node,
+    merge_candidates,
+    prefer_types,
+)
 from researchmind_agents.prompts.web_researcher import PROMPT_VERSION
+from researchmind_agents.reliability import SourceSignals, source_reliability
 from researchmind_agents.runtime import AgentRuntime
 from researchmind_agents.state import PassageItem, SubQuestionItem, WebResearchTask
 from researchmind_agents.storage import InMemoryResearchStore
@@ -605,3 +616,162 @@ class TestSourceCap:
         await run_node(runtime)
 
         assert len(store_of(runtime).sources) == 4
+
+
+# ===========================================================================
+# M5: researcher profiles and source scoring
+# ===========================================================================
+
+NOW = datetime(2026, 10, 27, tzinfo=UTC)
+DOCS_URL = "https://docs.rag.example/guide"
+
+
+def web_with_docs(count: int = 3) -> FakeWeb:
+    """Site pages match "rag retrieval" twice, the docs page once, so it ranks last."""
+    pages = {url(i): (f"rag page {i}", page_text(f"unique{i}")) for i in range(count)}
+    pages[DOCS_URL] = ("Guide", " ".join(f"Docs sentence {k} about rag setup." for k in range(30)))
+    return FakeWeb(pages=pages)
+
+
+def docs_sub_question() -> SubQuestionItem:
+    return SubQuestionItem(id="sq-1", text="How is RAG set up?", queries=["rag retrieval"])
+
+
+async def run_profile(
+    runtime: AgentRuntime, factory: Any, sq: SubQuestionItem | None = None
+) -> dict[str, Any]:
+    sq = sq or docs_sub_question()
+    await runtime.store.save_plan(run_id=RUN_ID, plan={}, sub_questions=[sq])
+    node = factory(runtime)
+    return await node(WebResearchTask(run_id=RUN_ID, question="Q", sub_question=sq.model_dump()))
+
+
+class _DatedPageExtract(FakePageExtract):
+    async def extract(self, url: str) -> PageContent:
+        page = await super().extract(url)
+        page.published_at = "2025-06-01T00:00:00+00:00"
+        return page
+
+
+class TestProfiles:
+    async def test_technical_researcher_attributes_events_and_usage(self) -> None:
+        runtime = build_fake_runtime(config(pages_per_sub_question=1), web=web_with_docs())
+
+        update = await run_profile(runtime, make_technical_researcher_node)
+
+        assert {e["agent"] for e in update["events"]} == {"technical_researcher"}
+        assert {e["agent"] for e in store_of(runtime).events} == {"technical_researcher"}
+        assert result_of(update)["agent"] == "technical_researcher"
+        assert [c["agent"] for c in update["llm_calls"]] == ["technical_researcher"]
+        assert set(runtime.budget.per_agent) == {"technical_researcher"}
+
+    async def test_market_researcher_attributes_events(self) -> None:
+        runtime = build_fake_runtime(web=make_web(2))
+
+        update = await run_profile(runtime, make_market_researcher_node, sub_question())
+
+        assert {e["agent"] for e in update["events"]} == {"market_researcher"}
+        assert result_of(update)["agent"] == "market_researcher"
+
+    async def test_web_researcher_keeps_its_name(self) -> None:
+        runtime = build_fake_runtime(web=make_web(2))
+
+        update = await run_node(runtime)
+
+        assert {e["agent"] for e in update["events"]} == {"web_researcher"}
+        assert result_of(update)["agent"] == "web_researcher"
+
+    async def test_selection_prompt_carries_guidance_and_source_types(self) -> None:
+        cfg = config(pages_per_sub_question=1)
+
+        technical = build_fake_runtime(cfg, web=web_with_docs())
+        await run_profile(technical, make_technical_researcher_node)
+        prompt = llm_of(technical).calls_for("SourceSelection")[0]["prompt"]
+        assert "You are the technical researcher" in prompt
+        assert "site: docs.rag.example (official docs)" in prompt
+        assert "(unknown)" not in prompt, "unknown types are not labelled"
+
+        market = build_fake_runtime(cfg, web=web_with_docs())
+        await run_profile(market, make_market_researcher_node)
+        market_prompt = llm_of(market).calls_for("SourceSelection")[0]["prompt"]
+        assert "You are the market and cost researcher" in market_prompt
+
+        web = build_fake_runtime(cfg, web=web_with_docs())
+        await run_profile(web, make_web_researcher_node)
+        web_prompt = llm_of(web).calls_for("SourceSelection")[0]["prompt"]
+        assert "Prefer:" in web_prompt
+        assert "You are the" not in web_prompt
+
+    async def test_specialists_read_preferred_source_types_first_without_a_model_pick(self) -> None:
+        cfg = config(pages_per_sub_question=1)
+        responses: dict[str, Any] = {"SourceSelection": RuntimeError("down")}
+
+        technical = build_fake_runtime(cfg, web=web_with_docs(), responses=responses)
+        update = await run_profile(technical, make_technical_researcher_node)
+        assert [s["url"] for s in update["sources"]] == [DOCS_URL]
+
+        web = build_fake_runtime(cfg, web=web_with_docs(), responses=responses)
+        update = await run_profile(web, make_web_researcher_node)
+        assert [s["url"] for s in update["sources"]] == [url(0)], "web keeps search order"
+
+    def test_prefer_types_is_stable(self) -> None:
+        candidates = [
+            Candidate("R1", "u1", "t", "s", "d", kind="forum"),
+            Candidate("R2", "u2", "t", "s", "d", kind="news"),
+            Candidate("R3", "u3", "t", "s", "d", kind="official_docs"),
+            Candidate("R4", "u4", "t", "s", "d", kind="news"),
+        ]
+        ordered = prefer_types(candidates, ("official_docs", "news"))
+        assert [c.label for c in ordered] == ["R3", "R2", "R4", "R1"]
+        assert prefer_types(candidates, ()) == candidates
+        assert TECHNICAL_PROFILE.preferred_types[0] == "official_docs"
+        assert MARKET_PROFILE.agent == "market_researcher"
+
+    def test_candidates_carry_their_source_type(self) -> None:
+        merged = merge_candidates(
+            ["q"],
+            {"q": [sr(DOCS_URL), sr("https://www.reddit.com/r/x"), sr("https://site.example/a")]},
+        )
+        assert [c.kind for c in merged] == ["official_docs", "forum", "unknown"]
+
+
+class TestSourceScoring:
+    async def test_stored_sources_are_typed_and_scored(self) -> None:
+        runtime = build_fake_runtime(web=web_with_docs(1), now=lambda: NOW)
+
+        update = await run_profile(runtime, make_web_researcher_node)
+
+        by_url = {s["url"]: s for s in update["sources"]}
+        docs = by_url[DOCS_URL]
+        assert docs["domain_type"] == "official_docs"
+        assert docs["published_at"] is None
+        assert docs["reliability_score"] == source_reliability(
+            SourceSignals(domain_type="official_docs"), now=NOW, config=runtime.config.scoring
+        )
+        site = by_url[url(0)]
+        assert site["domain_type"] == "unknown"
+        assert site["reliability_score"] < docs["reliability_score"]
+        stored = store_of(runtime).sources[docs["id"]]
+        assert stored["domain_type"] == "official_docs"
+        assert stored["reliability_score"] == docs["reliability_score"]
+        found = {
+            e["payload"]["url"]: e["payload"] for e in update["events"] if e["type"] == "source_found"
+        }
+        assert found[DOCS_URL]["domain_type"] == "official_docs"
+        assert found[DOCS_URL]["reliability_score"] == docs["reliability_score"]
+
+    async def test_publication_dates_are_stored_and_scored(self) -> None:
+        site = make_web(1)
+        runtime = build_fake_runtime(web=site, now=lambda: NOW)
+        runtime.page_extract = _DatedPageExtract(site)
+
+        update = await run_node(runtime)
+
+        [source] = update["sources"]
+        assert source["published_at"] == "2025-06-01T00:00:00+00:00"
+        assert source["reliability_score"] == source_reliability(
+            SourceSignals(domain_type="unknown", published_at=datetime(2025, 6, 1, tzinfo=UTC)),
+            now=NOW,
+            config=runtime.config.scoring,
+        )
+        assert store_of(runtime).sources[source["id"]]["published_at"] == source["published_at"]

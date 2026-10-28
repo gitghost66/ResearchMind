@@ -88,6 +88,7 @@ class RunLinks(BaseModel):
     self: str
     events: str
     report: str
+    graph: str
     sources: str
     usage: str
     cancel: str
@@ -99,6 +100,7 @@ class RunLinks(BaseModel):
             self=base,
             events=f"{base}/events",
             report=f"{base}/report",
+            graph=f"{base}/graph",
             sources=f"{base}/sources",
             usage=f"{base}/usage",
             cancel=f"{base}/cancel",
@@ -200,7 +202,7 @@ class ReportResponse(BaseModel):
     report_id: str
     version: int
     created_at: datetime | None = None
-    # Null until claim scoring lands (M5); never an LLM-invented number.
+    # Null for quick-mode reports (no verified claims); never an LLM-invented number.
     overall_confidence: float | None = None
     content: dict[str, Any]
     markdown: str

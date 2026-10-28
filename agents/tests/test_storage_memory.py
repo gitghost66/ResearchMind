@@ -6,7 +6,15 @@ import asyncio
 
 import pytest
 
-from researchmind_agents.state import PassageItem, ResearchReport, SourceItem, SubQuestionItem
+from researchmind_agents.state import (
+    ClaimItem,
+    ContradictionItem,
+    EvidenceItem,
+    PassageItem,
+    ResearchReport,
+    SourceItem,
+    SubQuestionItem,
+)
 from researchmind_agents.storage import InMemoryResearchStore
 
 
@@ -122,6 +130,102 @@ class TestPassages:
             )
 
 
+def link(pid: str, sid: str = "s1", stance: str = "supports") -> EvidenceItem:
+    return EvidenceItem(passage_id=pid, source_id=sid, stance=stance, excerpt=f"excerpt {pid}")  # type: ignore[arg-type]
+
+
+def claim_item(cid: str, *links: EvidenceItem, verdict: str = "supported") -> ClaimItem:
+    return ClaimItem(
+        id=cid,
+        text=f"Claim {cid}.",
+        sub_question_id="sq-1",
+        passage_ids=[links[0].passage_id] if links else [],
+        evidence=list(links),
+        verdict=verdict,  # type: ignore[arg-type]
+        confidence=0.6,
+        reason="Stated directly.",
+    )
+
+
+async def store_with_passages(run_id: str = "r") -> InMemoryResearchStore:
+    store = InMemoryResearchStore()
+    await store.save_source(run_id=run_id, source=source("s1", "https://a"))
+    await store.save_source(run_id=run_id, source=source("s2", "https://b"))
+    await store.save_passages(
+        run_id=run_id,
+        passages=[passage("p1", "s1"), passage("p2", "s1"), passage("p3", "s2")],
+        embeddings=[None, None, None],
+        embedding_model="m",
+    )
+    return store
+
+
+class TestClaims:
+    async def test_stores_claims_with_verdict_confidence_and_evidence(self) -> None:
+        store = await store_with_passages()
+        await store.save_claims(
+            run_id="r",
+            claims=[claim_item("c1", link("p1"), link("p3", "s2", "contradicts"), verdict="mixed")],
+        )
+
+        row = store.claims["c1"]
+        assert row["run_id"] == "r"
+        assert row["text"] == "Claim c1."
+        assert row["sub_question_id"] == "sq-1"
+        assert row["verdict"] == "mixed"
+        assert row["confidence"] == 0.6
+        assert row["passage_ids"] == ["p1"]
+        assert [(e["passage_id"], e["stance"]) for e in row["evidence"]] == [
+            ("p1", "supports"),
+            ("p3", "contradicts"),
+        ]
+        assert row["evidence"][0]["excerpt"] == "excerpt p1"
+
+    async def test_one_link_per_passage(self) -> None:
+        store = await store_with_passages()
+        await store.save_claims(
+            run_id="r", claims=[claim_item("c1", link("p1"), link("p1", stance="neutral"), link("p2"))]
+        )
+        evidence = store.claims["c1"]["evidence"]
+        assert [e["passage_id"] for e in evidence] == ["p1", "p2"]
+        # The first link for a passage wins.
+        assert evidence[0]["stance"] == "supports"
+
+    async def test_unverified_claims_are_stored_too(self) -> None:
+        store = await store_with_passages()
+        await store.save_claims(run_id="r", claims=[claim_item("c1", link("p1"), verdict="unverified")])
+        assert store.claims["c1"]["verdict"] == "unverified"
+
+    async def test_empty_list_is_a_no_op(self) -> None:
+        store = await store_with_passages()
+        await store.save_claims(run_id="r", claims=[])
+        assert store.claims == {}
+
+    async def test_claim_without_evidence_is_rejected(self) -> None:
+        store = await store_with_passages()
+        with pytest.raises(ValueError, match="no evidence"):
+            await store.save_claims(run_id="r", claims=[claim_item("c1")])
+
+    async def test_unknown_passage_is_rejected(self) -> None:
+        store = await store_with_passages()
+        with pytest.raises(ValueError, match="unknown passage_id"):
+            await store.save_claims(run_id="r", claims=[claim_item("c1", link("ghost"))])
+
+    async def test_passage_from_another_run_is_rejected(self) -> None:
+        store = await store_with_passages("r")
+        with pytest.raises(ValueError, match="unknown passage_id"):
+            await store.save_claims(run_id="other-run", claims=[claim_item("c1", link("p1"))])
+
+    async def test_a_bad_claim_stores_nothing(self) -> None:
+        """Like a rolled-back transaction: validation runs before any write."""
+        store = await store_with_passages()
+        with pytest.raises(ValueError):
+            await store.save_claims(
+                run_id="r", claims=[claim_item("good", link("p1")), claim_item("bad", link("ghost"))]
+            )
+        assert store.claims == {}
+
+
 class TestVectorSearch:
     async def make_store(self) -> InMemoryResearchStore:
         store = InMemoryResearchStore()
@@ -226,3 +330,51 @@ class TestReportsEventsIds:
 
     async def test_list_source_ids_empty(self) -> None:
         assert await InMemoryResearchStore().list_source_ids(run_id="r") == set()
+
+
+# ===========================================================================
+# M6: rounds and contradictions
+# ===========================================================================
+
+
+class TestM6:
+    async def test_save_plan_records_the_round(self) -> None:
+        store = InMemoryResearchStore()
+        await store.save_plan(run_id="r", plan={"o": 1}, sub_questions=[SubQuestionItem(id="a", text="A?")])
+        assert store.iterations["r"] == 0
+        await store.save_plan(
+            run_id="r",
+            plan={"o": 2},
+            sub_questions=[SubQuestionItem(id="b", text="B?", iteration=1, parent_id="a")],
+            iteration=1,
+        )
+        assert store.iterations["r"] == 1
+        assert set(store.sub_questions) == {"a", "b"}
+        assert store.sub_questions["b"]["parent_id"] == "a"
+        assert store.plans["r"] == {"o": 2}
+
+    async def test_contradictions_link_stored_claims(self) -> None:
+        store = await store_with_passages()
+        await store.save_claims(
+            run_id="r", claims=[claim_item("c1", link("p1")), claim_item("c2", link("p3", "s2"))]
+        )
+        item = ContradictionItem(
+            id="x1", claim_ids=["c1", "c2"], explanation="Differ.", likely_cause="date", resolved=True
+        )
+        await store.save_contradictions(run_id="r", contradictions=[item])
+        assert store.contradictions["x1"]["claim_ids"] == ["c1", "c2"]
+        assert store.contradictions["x1"]["run_id"] == "r"
+
+    async def test_bad_contradictions_store_nothing(self) -> None:
+        store = await store_with_passages()
+        await store.save_claims(run_id="r", claims=[claim_item("c1", link("p1"))])
+        good = ContradictionItem(id="x1", claim_ids=["c1", "c1"], explanation="e", likely_cause="date")
+        with pytest.raises(ValueError, match="two claims"):
+            await store.save_contradictions(run_id="r", contradictions=[good])
+        unknown = ContradictionItem(id="x2", claim_ids=["c1", "nope"], explanation="e", likely_cause="date")
+        with pytest.raises(ValueError, match="unknown claim_id"):
+            await store.save_contradictions(run_id="r", contradictions=[unknown])
+        other_run = ContradictionItem(id="x3", claim_ids=["c1", "c1b"], explanation="e", likely_cause="date")
+        with pytest.raises(ValueError):
+            await store.save_contradictions(run_id="other", contradictions=[other_run])
+        assert store.contradictions == {}

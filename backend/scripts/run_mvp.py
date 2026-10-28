@@ -35,8 +35,16 @@ RESULTS_DIR = REPO_ROOT / "agents" / "researchmind_agents" / "evals" / "results"
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run ResearchMind end to end (M3, quick mode).")
+    from researchmind_agents.modes import SUPPORTED_MODES
+
+    parser = argparse.ArgumentParser(description="Run ResearchMind end to end.")
     parser.add_argument("question", nargs="?", help="research question")
+    parser.add_argument(
+        "--mode",
+        choices=sorted(SUPPORTED_MODES),
+        default="quick",
+        help="research mode (deep, academic, and decision verify claims and loop)",
+    )
     parser.add_argument("--seed", action="store_true", help="run the seed eval instead")
     parser.add_argument("--limit", type=int, default=0, help="seed eval: first N questions only")
     parser.add_argument("--store", choices=["auto", "memory", "db"], default="auto")
@@ -118,6 +126,7 @@ async def _run(args: argparse.Namespace, settings: Any, use_db: bool, json_path:
                 rows.append(row)
             print()
             print(summarize(rows))
+            print(_latency_line(rows, args.mode))
     finally:
         if engine is not None:
             await engine.dispose()
@@ -142,7 +151,7 @@ async def _one(
     started = time.monotonic()
     try:
         outcome = await execute_research(
-            question, mode="quick", settings=settings, session_factory=session_factory
+            question, mode=args.mode, settings=settings, session_factory=session_factory
         )
     except Exception as exc:  # noqa: BLE001 - report and continue with the next question
         logging.getLogger("run_mvp").exception("run failed")
@@ -170,6 +179,9 @@ async def _one(
         "usage": outcome.usage,
         "seconds": outcome.seconds,
         "research_results": outcome.state.get("research_results", []),
+        "mode": args.mode,
+        "overall_confidence": outcome.report.get("overall_confidence"),
+        "verification": outcome.report.get("verification", {}),
         "markdown": outcome.markdown,
     }
 
@@ -191,6 +203,12 @@ def _print_row(row: dict[str, Any]) -> None:
         print(f"  {result['status']:9} sources={result['sources']} passages={result['passages']} "
               f"fetched={result['fetched']} failed={result['fetch_failures']} "
               f"dupes={result['duplicates']} {result['error'] or ''}")
+    if row.get("verification"):
+        v = row["verification"]
+        print("--- verification ---")
+        print(f"  claims extracted: {v.get('claims_extracted')}  checked: {v.get('claims_checked')}  "
+              f"used: {v.get('claims_used')}  by verdict: {v.get('by_verdict')}")
+        print(f"  overall confidence: {row.get('overall_confidence')}")
     print("--- grounding ---")
     print(f"  generation: {row['generation']}  sources cited: {row['sources']} "
           f"(stored: {row['sources_stored']})")
@@ -198,6 +216,21 @@ def _print_row(row: dict[str, Any]) -> None:
           f"({g.citation_resolution_rate:.0%})")
     print(f"  statements cited:   {g.statements_cited}/{g.statements_total} "
           f"({g.cited_statement_rate:.0%})  dropped: {g.dropped_statements}")
+
+
+def _latency_line(rows: list[dict[str, Any]], mode: str) -> str:
+    """Median run time against the mode's PRD target (M6: each mode at p50)."""
+    from statistics import median
+
+    from researchmind_agents.modes import mode_profile
+
+    times = [row["seconds"] for row in rows if not row.get("error")]
+    target = mode_profile(mode).target_seconds
+    if not times:
+        return "p50 latency: no completed runs"
+    p50 = median(times)
+    verdict = "met" if p50 <= target else "missed"
+    return f"p50 latency: {p50:.1f}s over {len(times)} run(s) (target {target:.0f}s for {mode}: {verdict})"
 
 
 def _write_json(rows: list[dict[str, Any]], path: Path | None, *, seed: bool, store: str) -> None:

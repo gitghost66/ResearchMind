@@ -5,7 +5,7 @@ Research runs as the API sees them.
   running, execute the graph, record the outcome. Handed to the
   :class:`~app.workers.job_runner.JobRunner`.
 * :class:`ResearchService` — what the routes call: create, read, cancel, and
-  delete runs, and read their report, sources, and usage.
+  delete runs, and read their report, evidence graph, sources, and usage.
 * :func:`recover_orphaned_runs` — the startup sweep: runs a previous process
   left ``queued``/``running`` are marked failed, so none stays stuck.
 
@@ -31,6 +31,7 @@ from app.core.config import Settings
 from app.core.errors import ApiError
 from app.models.evidence import Passage, Source
 from app.models.research import LLMUsage, Report, ResearchRun, RunEvent, SubQuestion
+from app.schemas.graph import EvidenceGraph
 from app.schemas.research import (
     CancelResponse,
     ReportResponse,
@@ -50,6 +51,8 @@ from app.schemas.research import (
     UsageLimits,
     UsageResponse,
 )
+from app.services.agent_runtime import build_agent_config
+from app.services.evidence_graph import build_evidence_graph, load_graph_data
 from app.services.research_runner import execute_run
 from app.services.run_events import (
     ACTIVE_STATUSES,
@@ -466,6 +469,12 @@ class ResearchService:
             content=dict(report.content or {}),
             markdown=report.markdown,
         )
+
+    async def graph(self, session: AsyncSession, run: ResearchRun) -> EvidenceGraph:
+        """The run's evidence graph, from what it has stored so far (any status)."""
+        scoring = build_agent_config(self.settings).scoring
+        data = await load_graph_data(session, run)
+        return build_evidence_graph(data, is_resolved=scoring.is_resolved)
 
     async def sources(self, session: AsyncSession, run: ResearchRun) -> SourceList:
         report = await _latest_report(session, run.id)

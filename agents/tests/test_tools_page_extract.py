@@ -8,8 +8,10 @@ redirects, IP literals, IPv6, and post-download size caps.
 
 from __future__ import annotations
 
+import json
 import socket
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
 
@@ -22,6 +24,7 @@ from researchmind_agents.tools.page_extract import (
     PageExtractTool,
     SSRFError,
     _blocked_network,
+    parse_published_date,
 )
 
 PUBLIC_IP = "93.184.216.34"
@@ -501,3 +504,112 @@ class TestFetchAndClean:
         await tool.aclose()  # injected client is not owned, so this is a no-op
         result = await tool.extract("http://example.com/page")
         assert result.ok
+
+
+# ===========================================================================
+# Publication date (M5: source recency)
+# ===========================================================================
+
+NOW = datetime(2026, 10, 27, 12, 0, tzinfo=UTC)
+
+
+def page_with_head(head: str) -> str:
+    return f"<html><head><title>T</title>{head}</head><body><main><p>Body text.</p></main></body></html>"
+
+
+class TestPublishedDate:
+    def test_article_meta_tag(self) -> None:
+        html = page_with_head(
+            '<meta property="article:published_time" content="2024-03-01T09:30:00+02:00">'
+        )
+        assert PageExtractTool._clean_html(html)["published_at"] == "2024-03-01T07:30:00+00:00"
+
+    def test_meta_keys_are_case_insensitive_and_ordered(self) -> None:
+        html = page_with_head(
+            '<meta name="DATE" content="2019-01-01">'
+            '<meta name="Citation_Publication_Date" content="2021/06/15">'
+        )
+        # citation_publication_date outranks a bare "date".
+        assert PageExtractTool._clean_html(html)["published_at"] == "2021-06-15T00:00:00+00:00"
+
+    def test_itemprop_meta(self) -> None:
+        html = page_with_head('<meta itemprop="datePublished" content="2023-11-02">')
+        assert PageExtractTool._clean_html(html)["published_at"] == "2023-11-02T00:00:00+00:00"
+
+    def test_invalid_meta_falls_through_to_the_next_source(self) -> None:
+        html = page_with_head(
+            '<meta property="article:published_time" content="not a date">'
+            '<script type="application/ld+json">{"datePublished": "2022-05-05"}</script>'
+        )
+        assert PageExtractTool._clean_html(html)["published_at"] == "2022-05-05T00:00:00+00:00"
+
+    def test_json_ld_in_a_graph(self) -> None:
+        ld = {
+            "@context": "https://schema.org",
+            "@graph": [
+                {"@type": "WebSite", "name": "Example"},
+                {"@type": "Article", "headline": "H", "datePublished": "2020-02-29T10:00:00Z"},
+            ],
+        }
+        html = page_with_head(f'<script type="application/ld+json">{json.dumps(ld)}</script>')
+        result = PageExtractTool._clean_html(html)
+        assert result["published_at"] == "2020-02-29T10:00:00+00:00"
+        assert "datePublished" not in result["text"]  # the script is still stripped from text
+
+    def test_bad_json_ld_is_ignored(self) -> None:
+        html = page_with_head(
+            '<script type="application/ld+json">{oops</script>'
+            '<script type="application/ld+json">[{"datePublished": "2018-07-01"}]</script>'
+        )
+        assert PageExtractTool._clean_html(html)["published_at"] == "2018-07-01T00:00:00+00:00"
+
+    def test_no_date(self) -> None:
+        assert PageExtractTool._clean_html(page_with_head(""))["published_at"] == ""
+
+    async def test_extract_sets_published_at(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return html_response(
+                page_with_head('<meta property="article:published_time" content="2025-01-10">')
+            )
+
+        result = await build_tool(handler).extract("http://example.com/page")
+
+        assert result.ok
+        assert result.published_at == "2025-01-10T00:00:00+00:00"
+
+    def test_page_content_defaults_to_no_date(self) -> None:
+        assert PageContent(url="http://example.com").published_at == ""
+
+
+class TestParsePublishedDate:
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("2024-03-01", "2024-03-01T00:00:00+00:00"),
+            ("2024-03-01T10:00:00Z", "2024-03-01T10:00:00+00:00"),
+            ("2024-03-01T10:00:00-05:00", "2024-03-01T15:00:00+00:00"),
+            ("2024-03-01T10:00:00", "2024-03-01T10:00:00+00:00"),
+            ("2024/3/7", "2024-03-07T00:00:00+00:00"),
+            ("2024-03", "2024-03-01T00:00:00+00:00"),
+            ("2024", "2024-01-01T00:00:00+00:00"),
+            ("  2024-03-01  ", "2024-03-01T00:00:00+00:00"),
+        ],
+    )
+    def test_accepted_formats(self, value: str, expected: str) -> None:
+        assert parse_published_date(value, now=NOW) == expected
+
+    @pytest.mark.parametrize(
+        "value",
+        ["", "   ", "yesterday", "2024-13-01", "2024/02/30", "1989-12-31", "0001-01-01", "2026-10-29"],
+    )
+    def test_rejected_values(self, value: str) -> None:
+        assert parse_published_date(value, now=NOW) == ""
+
+    def test_up_to_a_day_ahead_is_allowed(self) -> None:
+        # Timezones put a just-published page "tomorrow" for some readers.
+        assert parse_published_date("2026-10-28", now=NOW) == "2026-10-28T00:00:00+00:00"
+
+    def test_naive_now_is_treated_as_utc(self) -> None:
+        assert parse_published_date("2024-01-01", now=datetime(2025, 1, 1)) == (
+            "2024-01-01T00:00:00+00:00"
+        )

@@ -56,7 +56,7 @@ A multi-agent AI research system that decomposes complex questions, researches t
    ```
    Interactive API docs are at http://localhost:8000/docs.
 
-### Run a research question (M3)
+### Run a research question
 
 From the repository root, with `GEMINI_API_KEY` set in `backend/.env`:
 
@@ -64,9 +64,23 @@ From the repository root, with `GEMINI_API_KEY` set in `backend/.env`:
 # One question: prints the cited markdown report, usage, and a grounding check
 python backend/scripts/run_mvp.py "Is RAG better than fine-tuning for enterprise QA?"
 
+# Deep, academic, or decision mode: specialist researchers, fact-checked claims,
+# contradiction detection, gap-filling rounds, and a confidence score (more model
+# calls, so slower on the free tier); decision mode ends in a recommendation
+python backend/scripts/run_mvp.py --mode deep "PostgreSQL or MongoDB for an AI SaaS in 2026?"
+python backend/scripts/run_mvp.py --mode decision "PostgreSQL or MongoDB for an AI SaaS in 2026?"
+
 # Seed eval: runs agents/researchmind_agents/evals/seed.jsonl and writes
 # results to agents/researchmind_agents/evals/results/
 python backend/scripts/run_mvp.py --seed
+
+# Verification eval (M5): the fact checker on 20 hand-labelled claims
+# (one small model call each; no search, embeddings, or database)
+python backend/scripts/eval_verification.py
+
+# Contradiction eval (M6): the detector on 15 seeded cases (14 contradictions,
+# 3 cases with none); one embedding call and a model call or two per case
+python backend/scripts/eval_contradictions.py
 ```
 
 On Gemini's free tier a run takes about 1.5–2 minutes: embeddings are capped at
@@ -127,20 +141,71 @@ OpenAI-compatible LLM can be paired with Gemini embeddings. The default model is
 `gemini-embedding-001`, asked for 768-dimensional vectors to match the
 `vector(768)` column (`text-embedding-004` was shut down on 2026-01-14).
 
-## Research graph (quick mode)
+## Research graph
+
+| Mode | Researchers | Verified, with contradictions | Rounds | Report |
+|---|---|---|---|---|
+| `quick` | web | no | 1 | cited passages |
+| `deep` | web, technical, market | yes | up to `MAX_ITERATIONS` (3) | key findings, confidence |
+| `academic` | web, technical, market, academic (favoured) | yes | up to 3 | key findings, confidence |
+| `decision` | web, technical, market (favoured), academic | yes | up to 3 | plus a required recommendation |
 
 ```
-START → planner ─(one branch per sub-question, in parallel)→ web_researcher → synthesizer → END
-              └────────────(budget spent)────────────────────────────────────↗
+quick:     START → planner ─(branch per sub-question)→ web_researcher → synthesizer → END
+
+deep /     START → planner ─(branch per new sub-question, to its domain's researcher)→
+academic /         web | technical | market | academic researcher
+decision:          → claim_extractor → fact_checker → contradiction_detector
+                   → sufficiency_checker ─(gaps, and another round allowed)→ planner
+                                         └─(enough, or no round allowed)→ synthesizer → END
 ```
 
-- **Planner** — splits the question into 2–5 sub-questions with search queries.
-- **Web researcher** — searches, lets the model pick which results to read,
-  fetches pages, stores each as a source (de-duplicated across branches), then
-  chunks and embeds its text as passages.
-- **Synthesizer** — retrieves the passages most similar to each sub-question
-  and writes the report. The model sees sources as `S1`, `S2`, … and must cite
-  them on every statement; unknown or missing citations get one retry, then the
+- **Planner** — splits the question into sub-questions with search queries
+  (2–5 in `quick`, 4–8 in the other modes), and tags each with the researcher
+  that should handle it (`web`, `technical`, `market`, `academic`, as the mode
+  allows). In a gap-filling round it gets the coverage so far and the gaps, and
+  proposes at most `PLANNER_MAX_GAP_SUB_QUESTIONS` *new* sub-questions; one that
+  fills a sub-question's gap counts toward that sub-question.
+- **Web, technical, and market researchers** — one pipeline with different
+  guidance: search, let the model pick which results to read (technical prefers
+  documentation and benchmarks; market prefers pricing pages and industry
+  reports), fetch pages, store each as a source (de-duplicated across branches),
+  then chunk and embed its text as passages.
+- **Academic researcher** — searches arXiv and Semantic Scholar (over httpx; no
+  extra dependency) and stores each chosen paper's title and abstract as a
+  source. If the indexes return nothing (Semantic Scholar's keyless pool is
+  often rate-limited), it falls back to web search that prefers journals,
+  archives, and university sites.
+- **Claim extractor** — reads the most relevant passages per sub-question and
+  lists atomic claims, each tied to the passages it came from. A claim without
+  a valid passage is dropped, so every claim links to stored evidence.
+- **Fact checker** — checks each claim against its own passages and the most
+  similar passages from *other* sources. The model gives a verdict
+  (`supported`, `weak`, `mixed`, `unsupported`) and a stance per passage; code
+  makes the verdict agree with the stances and computes the confidence.
+- **Contradiction detector** — pairs usable claims that are similar
+  (`CONTRADICTION_MIN_SIMILARITY`) or that the fact checker linked (one claim's
+  passage contradicts the other), groups them by topic, and asks the model which
+  claims cannot both be true and why: `conditions`, `date`, `version`,
+  `dataset`, `methodology`, `definition`, or `unexplained`. Code decides from the
+  cause whether the contradiction is *resolved* (a difference in scope, so both
+  claims can hold — `CONFIDENCE_RESOLVED_CAUSES`); unresolved ones lower the
+  report's confidence.
+- **Sufficiency checker** — rules first: every sub-question needs
+  `SUFFICIENCY_MIN_CLAIMS_PER_SUB_QUESTION` usable claims from
+  `SUFFICIENCY_MIN_SITES_PER_SUB_QUESTION` independent sites. When the rules
+  pass, the model judges whether the claims answer the question and may name
+  missing aspects. Gaps send the run back to the planner, unless the run is at
+  `MAX_ITERATIONS`, out of research budget, or past its mode's
+  `LOOP_DEADLINE_SECONDS`. Each later round researches, extracts, checks, and
+  compares only its new material.
+- **Synthesizer** — in `quick` mode, writes from retrieved passages, citing
+  sources `S1`, `S2`, …. In the verified modes, writes only from usable verified
+  claims, citing claims `C1`, `C2`, …; each statement's sources are those of its
+  claims, and the report lists the key findings with verdicts and confidence,
+  and the contradictions between them (`X1`, …) with their likely causes. In
+  `decision` mode it must also write a recommendation; if none can be grounded,
+  the report says so. Unknown or missing citations get one retry, then the
   statement is dropped. Markdown is rendered from the validated JSON, so every
   citation points to a stored source.
 - **Budget** — `MAX_TOKENS_PER_RUN` / `MAX_COST_PER_RUN_USD` are enforced per
@@ -148,7 +213,28 @@ START → planner ─(one branch per sub-question, in parallel)→ web_researche
   if the cap is fully spent, the report quotes passages without a model call.
   A run always ends with a stored report.
 
-## Research API (M4)
+### Scoring (no number comes from a model)
+
+Formulas and weights are documented in
+`agents/researchmind_agents/reliability.py`; every weight is a setting
+(`RELIABILITY_*`, `CONFIDENCE_*`).
+
+- **Source reliability (0–1)** — base score by source type (peer-reviewed,
+  standards bodies, official docs, government > academic, preprints, news >
+  reference, code repositories, company blogs > personal blogs, unknown >
+  forums), times a recency factor, plus citation and methodology bonuses for
+  papers. Types come from the versioned list in
+  `agents/researchmind_agents/data/domains.json` plus TLD, host, and path rules.
+- **Claim confidence (0–1)** — `verdict weight × corroboration × agreement`.
+  Each site counts once; independent supporting sites combine by noisy-OR (one
+  source alone reaches at most 0.8 × its reliability), and contradicting
+  sources lower the agreement ratio.
+- **Report confidence** — the cited claims' confidence, weighted by how many
+  statements cite each, reduced for sub-questions without a verified claim and
+  by `CONFIDENCE_CONTRADICTION_PENALTY` per unresolved contradiction (up to the
+  cap).
+
+## Research API (M4, M6)
 
 Every `/api/v1/research` route needs the `X-API-Key` header (when `API_KEY` is
 set) and counts against a per-key rate limit. Errors always look like
@@ -160,8 +246,9 @@ set) and counts against a per-key rate limit. Errors always look like
 | GET | `/api/v1/research` | List runs, newest first: `?limit=&offset=&status=&mode=` |
 | GET | `/api/v1/research/{id}` | Status, plan, sub-questions, and progress per step |
 | GET | `/api/v1/research/{id}/events` | Server-Sent Events: replay, then live, until the run ends |
-| GET | `/api/v1/research/{id}/report` | Report JSON + markdown (409 while running, 404 if none) |
-| GET | `/api/v1/research/{id}/sources` | Stored sources, with passage counts and whether the report cites them |
+| GET | `/api/v1/research/{id}/report` | Report JSON + markdown; in the verified modes, key findings with verdicts, contradictory evidence, and an overall confidence, plus a recommendation in `decision` (409 while running, 404 if none) |
+| GET | `/api/v1/research/{id}/graph` | Evidence graph for a React Flow view: `{nodes, edges}` (see below); available while the run is in progress |
+| GET | `/api/v1/research/{id}/sources` | Stored sources with type, reliability score, publication date, passage counts, and whether the report cites them |
 | GET | `/api/v1/research/{id}/usage` | Calls, tokens, cost, and latency — total, per agent, per model |
 | POST | `/api/v1/research/{id}/cancel` | Cancel a queued or running run (409 if it already ended) |
 | DELETE | `/api/v1/research/{id}` | Cancel if active, then delete the run and all its data (204) |
@@ -175,11 +262,24 @@ curl -s -H "$KEY" http://localhost:8000/api/v1/research/$RUN/report   # once it 
 curl -s -X POST -H "$KEY" http://localhost:8000/api/v1/research/$RUN/cancel
 ```
 
+**Evidence graph.** Nodes are `{id, type, label, meta}` with `type` one of
+`question`, `sub_question`, `claim`, `passage`, `source` (IDs are
+`<type>:<record id>`); claim nodes carry `verdict` and `confidence`. Edges are
+`{id, from, to, type, meta}`: `decomposes` (question → sub-question,
+sub-question → gap-filling follow-up, sub-question → claim), `supports` /
+`contradicts` (passage → claim, from the fact checker), `contradicts` (claim →
+claim, a detected contradiction, with `likely_cause` and `resolved` in `meta`),
+and `cites` (passage → its source). The schema is `EvidenceGraph` in
+`backend/app/schemas/graph.py` and in the OpenAPI docs.
+
 **Events.** Each SSE event's `event:` is its type and its `id:` is the run's
 event sequence number (`seq`, 1, 2, 3, ...). Types include `run_status`
 (queued → running → completed / failed / cancelled), `agent_started`,
-`agent_finished`, `search_completed`, `source_found`, `report_ready`, and
-`error` (an agent hit a problem; the run continues). The stream closes after
+`agent_finished`, `search_completed`, `source_found` (with the source's type and
+reliability), `claims_extracted`, `claim_verified` (verdict and confidence),
+`contradiction_found` (claims, likely cause, resolved), `sufficiency_checked`
+(the round's gaps and whether another round runs), `report_ready`, and `error`
+(an agent hit a problem; the run continues). The stream closes after
 the terminal `run_status`. To resume after a dropped connection, send
 `Last-Event-ID: <seq>` (browsers' `EventSource` does this itself) or
 `?after=<seq>`. `EventSource` cannot send `X-API-Key`, so a web client should
@@ -210,9 +310,11 @@ run to LangSmith as one trace (named `research:<mode>`, tagged with its
 Client ──REST──► FastAPI ──asyncio task (JobRunner)──► LangGraph workflow
    ▲               │  ▲                                   │      │
    │ SSE           │  └──── wake-up on each new event ────┤      ├──► Gemini API
-   └─ run_events ──┘                                      │      └──► web search + pages
+   └─ run_events ──┘                                      │      ├──► web search + pages
+                                                          │      └──► arXiv + Semantic Scholar
       (seq order)  ▼                                      ▼
-            Supabase PostgreSQL + pgvector  ◄── runs, sources, passages, events, usage, reports
+            Supabase PostgreSQL + pgvector  ◄── runs, sources, passages, claims, contradictions,
+                                                events, usage, reports
 ```
 
 ## Project Structure
@@ -231,8 +333,14 @@ Client ──REST──► FastAPI ──asyncio task (JobRunner)──► LangG
 - [ ] **M3** — MVP graph (Planner → Web Research → Synthesizer)
 - [x] **M4** — API and background jobs (REST API, SSE with resume, cancel,
       in-process job runner, API-key auth, rate limits, startup recovery)
-- [ ] **M5** — Specialized agents and verification
-- [ ] **M6** — Contradictions, loop, evidence graph
+- [x] **M5** — Specialized agents and verification (technical, market, and
+      academic researchers; claim extraction; fact checking; deterministic
+      source reliability and claim/report confidence; `deep` and `academic`
+      modes). Live verification eval pending.
+- [x] **M6** — Contradictions, loop, evidence graph (contradiction detector with
+      likely causes; sufficiency check and gap-filling loop; `decision` mode;
+      per-mode planner bounds and loop deadlines; `/graph` endpoint). Live
+      contradiction eval and latency checks pending.
 - [ ] **M7** — Evaluation framework
 - [ ] **M8** — Hardening and deployment
 

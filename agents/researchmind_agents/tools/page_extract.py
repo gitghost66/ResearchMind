@@ -13,6 +13,9 @@ Security measures (PRD s10):
 * **Content-type allowlist** — binary payloads are rejected before parsing.
 * **robots.txt** — fetched, cached, and honoured (PRD s4).
 
+The publication date, when a page declares one in its metadata (meta tags or
+JSON-LD), is returned as ``published_at`` for source reliability scoring.
+
 Retrieved text is data, never instructions: this module only extracts and
 returns it, and never lets it influence a request.
 
@@ -23,11 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
 import re
 import socket
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
@@ -38,7 +44,13 @@ from researchmind_agents.config import PageExtractConfig
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PageContent", "PageExtractTool", "SSRFError", "RobotsDisallowedError"]
+__all__ = [
+    "PageContent",
+    "PageExtractTool",
+    "SSRFError",
+    "RobotsDisallowedError",
+    "parse_published_date",
+]
 
 # ---------------------------------------------------------------------------
 # SSRF block-list
@@ -79,6 +91,30 @@ _DROP_TAGS = {
 
 _WHITESPACE_RE = re.compile(r"\s{3,}")
 
+# Metadata naming a page's publication date, most specific first. Matched
+# case-insensitively against a meta tag's property, name, or itemprop.
+_DATE_META_KEYS = (
+    "article:published_time",
+    "og:published_time",
+    "datepublished",
+    "citation_publication_date",
+    "citation_date",
+    "dc.date.issued",
+    "dc.date",
+    "date",
+    "publish-date",
+    "pubdate",
+)
+# Bounds on JSON-LD parsing: blocks read, characters per block, nodes visited.
+_JSONLD_MAX_BLOCKS = 10
+_JSONLD_MAX_CHARS = 200_000
+_JSONLD_MAX_NODES = 2_000
+# Dates before this are almost always parse noise (e.g. "0001-01-01").
+_MIN_PUBLISHED_YEAR = 1990
+_YMD_SLASH = re.compile(r"^(\d{4})/(\d{1,2})/(\d{1,2})$")
+_YEAR_MONTH = re.compile(r"^(\d{4})-(\d{1,2})$")
+_YEAR_ONLY = re.compile(r"^(\d{4})$")
+
 
 # ---------------------------------------------------------------------------
 # Errors and results
@@ -107,6 +143,8 @@ class PageContent:
     content_type: str = ""
     truncated: bool = False
     error: str = ""
+    # ISO 8601 in UTC, from the page's metadata; "" when it declares none.
+    published_at: str = ""
 
     @property
     def ok(self) -> bool:
@@ -369,6 +407,7 @@ class PageExtractTool:
                 status_code=response.status_code,
                 content_type=content_type,
                 truncated=truncated,
+                published_at=cleaned["published_at"],
             )
 
         raise ValueError(f"Exceeded {self._config.max_redirects} redirects for {url}")
@@ -428,7 +467,7 @@ class PageExtractTool:
     # so it can be handed to asyncio.to_thread without binding self.
     @staticmethod
     def _clean_html(html: str) -> dict[str, str]:
-        """Parse HTML and return ``{"title": ..., "text": ...}``."""
+        """Parse HTML and return ``{"title": ..., "text": ..., "published_at": ...}``."""
         return _clean_html(html)
 
 
@@ -467,12 +506,15 @@ def _normalise_redirect(current: str, location: str) -> str:
 
 
 def _clean_html(html: str) -> dict[str, str]:
-    """Strip boilerplate and return the title plus readable text."""
+    """Strip boilerplate and return the title, readable text, and publication date."""
     soup = BeautifulSoup(html, "html.parser")
 
     title = ""
     if soup.title and soup.title.string:
         title = soup.title.string.strip()
+
+    # Read the date first: JSON-LD lives in <script> tags, which are dropped below.
+    published_at = _find_published_date(soup)
 
     for tag in soup.find_all(_DROP_TAGS):
         tag.decompose()
@@ -491,4 +533,102 @@ def _clean_html(html: str) -> dict[str, str]:
     lines = [line.strip() for line in raw_text.splitlines()]
     text = _WHITESPACE_RE.sub("  ", "\n".join(line for line in lines if line))
 
-    return {"title": title, "text": text}
+    return {"title": title, "text": text, "published_at": published_at}
+
+
+# ---------------------------------------------------------------------------
+# Publication date
+# ---------------------------------------------------------------------------
+
+
+def parse_published_date(value: str, *, now: datetime | None = None) -> str:
+    """
+    Normalise a publication date to an ISO 8601 UTC string.
+
+    Accepts ISO 8601 (``Z``, offsets, date-only), ``YYYY/MM/DD``, ``YYYY-MM``,
+    and ``YYYY``. A value without a timezone is taken as UTC. Returns ``""`` for
+    anything unparseable, before 1990, or more than a day in the future.
+    """
+    text = (value or "").strip()
+    if not text:
+        return ""
+    parsed = _parse_date_text(text)
+    if parsed is None:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    parsed = parsed.astimezone(UTC)
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
+    if parsed.year < _MIN_PUBLISHED_YEAR or parsed > reference + timedelta(days=1):
+        return ""
+    return parsed.isoformat()
+
+
+def _parse_date_text(text: str) -> datetime | None:
+    candidate = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        return datetime.fromisoformat(candidate)
+    except ValueError:
+        pass
+    try:
+        if match := _YMD_SLASH.match(text):
+            year, month, day = (int(part) for part in match.groups())
+            return datetime(year, month, day)
+        if match := _YEAR_MONTH.match(text):
+            return datetime(int(match.group(1)), int(match.group(2)), 1)
+        if match := _YEAR_ONLY.match(text):
+            return datetime(int(match.group(1)), 1, 1)
+    except ValueError:
+        return None
+    return None
+
+
+def _find_published_date(soup: BeautifulSoup) -> str:
+    """The first valid date from meta tags (in key order), then from JSON-LD."""
+    found: dict[str, str] = {}
+    for meta in soup.find_all("meta"):
+        content = meta.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        for attr in ("property", "name", "itemprop"):
+            key = meta.get(attr)
+            if isinstance(key, str):
+                found.setdefault(key.strip().lower(), content.strip())
+    for key in _DATE_META_KEYS:
+        if key in found:
+            parsed = parse_published_date(found[key])
+            if parsed:
+                return parsed
+
+    scripts = soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)})
+    for script in scripts[:_JSONLD_MAX_BLOCKS]:
+        raw = script.string or script.get_text() or ""
+        if not raw.strip() or len(raw) > _JSONLD_MAX_CHARS:
+            continue
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            continue
+        parsed = parse_published_date(_jsonld_date(data))
+        if parsed:
+            return parsed
+    return ""
+
+
+def _jsonld_date(data: Any) -> str:
+    """Breadth-first search for a ``datePublished`` string over a bounded number of nodes."""
+    queue: list[Any] = [data]
+    visited = 0
+    while queue and visited < _JSONLD_MAX_NODES:
+        node = queue.pop(0)
+        visited += 1
+        if isinstance(node, dict):
+            value = node.get("datePublished")
+            if isinstance(value, str) and value.strip():
+                return value
+            queue.extend(v for v in node.values() if isinstance(v, dict | list))
+        elif isinstance(node, list):
+            queue.extend(v for v in node if isinstance(v, dict | list))
+    return ""

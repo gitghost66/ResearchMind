@@ -9,6 +9,9 @@ and live-stream tests.
 
 M4 acceptance: POST creates a run; SSE streams events live; the report
 endpoint returns the result; cancel stops a run.
+
+M5: a deep-mode run stores scored sources and verified claims linked to
+passages, and its report carries verdicts and a confidence.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
 from app.main import create_app
+from app.models.claims import Claim, ClaimEvidence
 from app.models.evidence import Passage, Source
 from app.models.research import LLMUsage, Report, ResearchRun, RunEvent, SubQuestion
 from app.services import research_service
@@ -118,7 +122,8 @@ class TestCreate:
         assert cited and cited <= stored
         assert report["markdown"].startswith("# ")
         assert report["version"] == 1
-        assert report["overall_confidence"] is None  # scored from M5
+        # Quick mode does not verify claims, so its report is unscored.
+        assert report["overall_confidence"] is None
 
     @pytest.mark.parametrize(
         ("body", "field", "kind"),
@@ -126,7 +131,7 @@ class TestCreate:
             ({"question": ""}, "question", "string_too_short"),
             ({"question": "   "}, "question", "value_error"),
             ({"question": "x" * 101}, "question", "string_too_long"),
-            ({"question": "q", "mode": "deep"}, "mode", "unsupported_mode"),
+            ({"question": "q", "mode": "nonsense"}, "mode", "unsupported_mode"),
             ({"question": "q", "user_context": {"note": "y" * 300}}, "user_context", "too_large"),
             ({"question": "q", "max_sources": 6}, "max_sources", "less_than_equal"),
             ({"question": "q", "max_sources": 0}, "max_sources", "greater_than_equal"),
@@ -351,6 +356,109 @@ class TestRead:
 # ===========================================================================
 # Events (SSE)
 # ===========================================================================
+
+
+class TestVerifiedRun:
+    """M5 over HTTP: a deep-mode run, with the agents' fakes."""
+
+    async def test_deep_run_report_has_verdicts_and_confidence(self, api: ApiHarness) -> None:
+        run_id = await api.create(mode="deep")
+        await api.wait_for(run_id, "completed")
+
+        report = (await api.client.get(f"{BASE}/{run_id}/report")).json()
+        content = report["content"]
+        assert 0.0 < report["overall_confidence"] <= 1.0
+        assert report["overall_confidence"] == content["overall_confidence"]
+        assert content["key_findings"]
+        for finding in content["key_findings"]:
+            assert finding["verdict"] in {"supported", "weak", "mixed"}
+            assert 0.0 <= finding["confidence"] <= 1.0
+        assert content["verification"]["claims_checked"] >= len(content["key_findings"])
+        assert "**Overall confidence:**" in report["markdown"]
+
+        # The stored column matches the JSON (it is NOT NULL, unlike quick mode's null).
+        async with api.session_factory() as session:
+            row = (await session.execute(select(Report))).scalars().one()
+        assert row.overall_confidence == pytest.approx(report["overall_confidence"])
+
+    async def test_deep_run_stores_claims_linked_to_its_passages(self, api: ApiHarness) -> None:
+        run_id = await api.create(mode="deep")
+        await api.wait_for(run_id, "completed")
+
+        async with api.session_factory() as session:
+            claims = (
+                (await session.execute(select(Claim).where(Claim.run_id == uuid.UUID(run_id))))
+                .scalars()
+                .all()
+            )
+            links = (await session.execute(select(ClaimEvidence, Passage.source_id).join(
+                Passage, Passage.id == ClaimEvidence.passage_id
+            ))).all()
+            run_sources = {
+                s.id
+                for s in (
+                    await session.execute(select(Source).where(Source.run_id == uuid.UUID(run_id)))
+                ).scalars()
+            }
+
+        assert claims
+        linked = {link.claim_id for link, _ in links}
+        assert {c.id for c in claims} <= linked, "every claim links to at least one passage"
+        assert all(source_id in run_sources for _, source_id in links)
+        assert all(c.verdict != "unverified" for c in claims)
+
+    async def test_deep_run_progress_lists_the_verified_pipeline(self, api: ApiHarness) -> None:
+        run_id = await api.create(mode="deep")
+        detail = await api.wait_for(run_id, "completed")
+
+        steps = {s["agent"]: s["status"] for s in detail["progress"]["steps"]}
+        assert list(steps) == [
+            "planner",
+            "web_researcher",
+            "technical_researcher",
+            "market_researcher",
+            "claim_extractor",
+            "fact_checker",
+            "contradiction_detector",
+            "sufficiency_checker",
+            "synthesizer",
+        ]
+        # The fake plan has a web and a technical sub-question, and no market one.
+        assert steps["market_researcher"] == "skipped"
+        assert all(
+            status == "completed" for agent, status in steps.items() if agent != "market_researcher"
+        )
+        assert {sq["domain"] for sq in detail["sub_questions"]} == {"web", "technical"}
+
+    async def test_sources_carry_reliability_scores(self, api: ApiHarness) -> None:
+        run_id = await api.create(mode="deep")
+        await api.wait_for(run_id, "completed")
+
+        items = (await api.client.get(f"{BASE}/{run_id}/sources")).json()["items"]
+        assert items
+        # Fake pages sit on unlisted .example hosts: typed "unknown", scored
+        # below the 0.5 placeholder an unscored source would show.
+        assert {item["domain_type"] for item in items} == {"unknown"}
+        assert all(0.0 < item["reliability_score"] < 0.5 for item in items)
+
+    async def test_claim_verified_events_are_streamed(self, api: ApiHarness) -> None:
+        run_id = await api.create(mode="deep")
+        await api.wait_for(run_id, "completed")
+
+        events = await stream(api, run_id)
+        verified = [e["data"] for e in events if e.get("event") == "claim_verified"]
+        assert verified
+        assert all(e["agent"] == "fact_checker" for e in verified)
+        assert all({"claim_id", "verdict", "confidence"} <= set(e["payload"]) for e in verified)
+
+    async def test_academic_mode_is_accepted(self, api: ApiHarness) -> None:
+        run_id = await api.create(mode="academic")
+        detail = await api.wait_for(run_id, "completed")
+        # The harness's paper index is empty, so the academic branch falls back
+        # to web search and the run still completes with a scored report.
+        assert "academic_researcher" in {s["agent"] for s in detail["progress"]["steps"]}
+        report = (await api.client.get(f"{BASE}/{run_id}/report")).json()
+        assert report["overall_confidence"] is not None
 
 
 class TestEvents:
@@ -781,3 +889,52 @@ def create_bad_engine() -> Any:
     from sqlalchemy.ext.asyncio import create_async_engine
 
     return create_async_engine("sqlite+aiosqlite:////nonexistent-dir/x/y.db")
+
+
+# ===========================================================================
+# M6 over HTTP: decision mode and the gap-filling loop
+# ===========================================================================
+
+
+class TestM6Run:
+    async def test_decision_run_ends_in_a_recommendation(self, api: ApiHarness) -> None:
+        run_id = await api.create(mode="decision", user_context={"team": "three engineers"})
+        detail = await api.wait_for(run_id, "completed")
+
+        steps = [s["agent"] for s in detail["progress"]["steps"]]
+        assert steps[-3:] == ["contradiction_detector", "sufficiency_checker", "synthesizer"]
+        assert "academic_researcher" in steps
+        assert "market" in {sq["domain"] for sq in detail["sub_questions"]}
+        report = (await api.client.get(f"{BASE}/{run_id}/report")).json()
+        assert report["content"]["recommendation"]
+        assert "## Recommendation" in report["markdown"]
+        assert report["overall_confidence"] is not None
+
+    async def test_a_gap_round_is_recorded_on_the_run(self, make_api: MakeApi) -> None:
+        # No sub-question can be covered, so the first round always has gaps.
+        api = await make_api(sufficiency_min_sites_per_sub_question=99)
+        run_id = await api.create(mode="deep")
+        detail = await api.wait_for(run_id, "completed")
+
+        assert detail["iteration"] == 1
+        [round_] = detail["plan"]["rounds"]
+        assert round_["iteration"] == 1 and round_["gaps"]
+        steps = {s["agent"]: s for s in detail["progress"]["steps"]}
+        assert steps["planner"]["started"] == 2 and steps["planner"]["status"] == "completed"
+
+        events = await stream(api, run_id)
+        checks = [e["data"]["payload"] for e in events if e.get("event") == "sufficiency_checked"]
+        # The fake gap planner adds nothing, so round 1 goes straight to the report.
+        assert [c["decision"] for c in checks] == ["loop"]
+        report = (await api.client.get(f"{BASE}/{run_id}/report")).json()
+        assert report["content"]["coverage"]["iterations"] == 2
+
+    async def test_quick_mode_is_unchanged(self, api: ApiHarness) -> None:
+        run_id = await api.create(mode="quick")
+        detail = await api.wait_for(run_id, "completed")
+        assert [s["agent"] for s in detail["progress"]["steps"]] == [
+            "planner",
+            "web_researcher",
+            "synthesizer",
+        ]
+        assert detail["iteration"] == 0

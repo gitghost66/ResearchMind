@@ -1,0 +1,107 @@
+{
+  "version": "domains/v1",
+  "updated": "2026-10-27",
+  "notes": "Host -> domain type for source reliability (reliability.py). A host matches an entry when it equals it or ends with '.' + entry; the longest match wins. Sites not listed fall through to the suffix, host-prefix and path rules, then 'unknown'. Base scores per type live in ScoringConfig.",
+  "types": {
+    "peer_reviewed": [
+      "nature.com", "science.org", "sciencedirect.com", "springer.com", "wiley.com",
+      "tandfonline.com", "ieeexplore.ieee.org", "dl.acm.org", "plos.org", "pnas.org",
+      "cell.com", "thelancet.com", "nejm.org", "bmj.com", "jamanetwork.com",
+      "frontiersin.org", "mdpi.com", "aclanthology.org", "jmlr.org", "proceedings.mlr.press",
+      "neurips.cc", "papers.nips.cc", "ojs.aaai.org", "usenix.org", "sagepub.com",
+      "academic.oup.com", "cambridge.org", "jstor.org", "pubmed.ncbi.nlm.nih.gov",
+      "ncbi.nlm.nih.gov", "biomedcentral.com", "elifesciences.org", "iopscience.iop.org",
+      "journals.aps.org", "pubs.acs.org", "pubs.rsc.org", "annualreviews.org",
+      "cochranelibrary.com", "doi.org", "vldb.org", "computer.org"
+    ],
+    "preprint": [
+      "arxiv.org", "biorxiv.org", "medrxiv.org", "ssrn.com", "openreview.net",
+      "researchgate.net", "osf.io", "chemrxiv.org", "eprint.iacr.org",
+      "semanticscholar.org", "paperswithcode.com"
+    ],
+    "standards_body": [
+      "w3.org", "ietf.org", "rfc-editor.org", "iso.org", "standards.ieee.org",
+      "ecma-international.org", "whatwg.org", "unicode.org", "owasp.org", "nist.gov",
+      "itu.int", "etsi.org", "3gpp.org", "oasis-open.org", "khronos.org",
+      "pcisecuritystandards.org", "cisecurity.org", "opengroup.org"
+    ],
+    "official_docs": [
+      "docs.python.org", "python.org", "developer.mozilla.org", "postgresql.org",
+      "kubernetes.io", "docs.aws.amazon.com", "learn.microsoft.com", "ai.google.dev",
+      "developers.google.com", "platform.openai.com", "docs.anthropic.com",
+      "docs.github.com", "react.dev", "nodejs.org", "rust-lang.org", "go.dev",
+      "docs.oracle.com", "redis.io", "sqlite.org", "nginx.org", "apache.org",
+      "pytorch.org", "tensorflow.org", "fastapi.tiangolo.com", "docs.pydantic.dev",
+      "numpy.org", "pandas.pydata.org", "scikit-learn.org", "readthedocs.io",
+      "readthedocs.org", "man7.org", "kernel.org", "llvm.org", "gnu.org",
+      "langchain-ai.github.io", "docs.docker.com", "docs.djangoproject.com"
+    ],
+    "government": [
+      "europa.eu", "who.int", "un.org", "oecd.org", "worldbank.org", "imf.org",
+      "iea.org", "irena.org", "ipcc.ch", "nhs.uk"
+    ],
+    "news": [
+      "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "nytimes.com",
+      "washingtonpost.com", "theguardian.com", "ft.com", "wsj.com", "economist.com",
+      "bloomberg.com", "cnbc.com", "theverge.com", "arstechnica.com", "wired.com",
+      "techcrunch.com", "zdnet.com", "infoworld.com", "theregister.com",
+      "venturebeat.com", "axios.com", "npr.org", "scientificamerican.com",
+      "newscientist.com", "spectrum.ieee.org", "technologyreview.com", "hbr.org",
+      "forbes.com", "fortune.com", "businessinsider.com", "gartner.com",
+      "mckinsey.com", "statista.com", "idc.com", "forrester.com", "lwn.net",
+      "carbonbrief.org"
+    ],
+    "reference": [
+      "wikipedia.org", "britannica.com", "investopedia.com", "merriam-webster.com",
+      "wiktionary.org", "wikidata.org"
+    ],
+    "code_repository": [
+      "github.com", "gitlab.com", "bitbucket.org", "pypi.org", "npmjs.com",
+      "crates.io", "huggingface.co", "sourceforge.net", "codeberg.org"
+    ],
+    "company_blog": [
+      "blog.google", "engineering.fb.com", "netflixtechblog.com", "openai.com",
+      "anthropic.com", "deepmind.google", "research.google", "ai.meta.com",
+      "databricks.com", "blog.cloudflare.com", "stackoverflow.blog", "github.blog",
+      "dropbox.tech", "slack.engineering", "shopify.engineering",
+      "engineering.atspotify.com", "pinecone.io", "weaviate.io", "timescale.com",
+      "neon.tech", "planetscale.com", "supabase.com"
+    ],
+    "blog": [
+      "medium.com", "substack.com", "dev.to", "hashnode.dev", "hackernoon.com",
+      "towardsdatascience.com", "wordpress.com", "blogspot.com", "tumblr.com",
+      "freecodecamp.org", "geeksforgeeks.org", "tutorialspoint.com", "w3schools.com",
+      "javatpoint.com", "analyticsvidhya.com", "kdnuggets.com", "linkedin.com",
+      "youtube.com"
+    ],
+    "forum": [
+      "reddit.com", "stackoverflow.com", "stackexchange.com", "superuser.com",
+      "serverfault.com", "askubuntu.com", "quora.com", "news.ycombinator.com",
+      "discord.com", "twitter.com", "x.com", "facebook.com", "tiktok.com"
+    ]
+  },
+  "suffix_rules": [
+    [".gov", "government"], [".mil", "government"], [".gov.uk", "government"],
+    [".gov.au", "government"], [".gc.ca", "government"], [".gov.in", "government"],
+    [".nic.in", "government"], [".gouv.fr", "government"], [".bund.de", "government"],
+    [".go.jp", "government"], [".gov.cn", "government"], [".int", "government"],
+    [".edu", "academic"], [".ac.uk", "academic"], [".edu.au", "academic"],
+    [".ac.in", "academic"], [".ac.jp", "academic"], [".edu.cn", "academic"],
+    [".ac.nz", "academic"], [".ac.za", "academic"], [".ac.kr", "academic"]
+  ],
+  "host_prefixes": [
+    ["docs.", "official_docs"], ["doc.", "official_docs"], ["developer.", "official_docs"],
+    ["developers.", "official_docs"], ["learn.", "official_docs"],
+    ["blog.", "company_blog"], ["engineering.", "company_blog"],
+    ["forum.", "forum"], ["forums.", "forum"], ["community.", "forum"],
+    ["discuss.", "forum"]
+  ],
+  "path_prefixes": [
+    ["/docs", "official_docs"], ["/documentation", "official_docs"],
+    ["/manual", "official_docs"], ["/reference", "official_docs"],
+    ["/pricing", "official_docs"],
+    ["/blog", "company_blog"], ["/blogs", "company_blog"],
+    ["/forum", "forum"], ["/forums", "forum"], ["/community", "forum"],
+    ["/questions", "forum"], ["/answers", "forum"]
+  ]
+}

@@ -17,9 +17,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from researchmind_agents.state import (
+    ClaimItem,
+    ContradictionItem,
     PassageItem,
     ResearchReport,
     SourceItem,
@@ -33,6 +36,7 @@ from researchmind_agents.tools.vector_search import (
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.models.claims import Claim, ClaimEvidence, Contradiction, ContradictionClaim
 from app.models.research import SubQuestion
 from app.repositories.evidence_repository import PassageRepository, SourceRepository
 from app.repositories.research_repository import ReportRepository, ResearchRunRepository
@@ -74,10 +78,15 @@ class SqlResearchStore:
         run_id: str,
         plan: dict[str, Any],
         sub_questions: list[SubQuestionItem],
+        iteration: int = 0,
     ) -> None:
         run_uuid = _uuid(run_id)
         async with self._session_factory() as session:
-            await ResearchRunRepository(session).update(run_uuid, plan=dict(plan))
+            # A gap-filling round passes the whole plan and only its new
+            # sub-questions; the run's iteration records the round.
+            await ResearchRunRepository(session).update(
+                run_uuid, plan=dict(plan), iteration=iteration
+            )
             session.add_all(
                 SubQuestion(
                     id=_uuid(item.id),
@@ -118,14 +127,17 @@ class SqlResearchStore:
             if existing is not None:
                 return str(existing.id), False
 
-            # published_at, domain_type and reliability_score keep their
-            # defaults: source scoring arrives in M5 and is never guessed here.
+            # Scores come from the agents package (reliability.py); this
+            # layer stores them and never computes one.
             created = await repo.create(
                 id=_uuid(source.id),
                 run_id=run_uuid,
                 url=source.url,
                 title=source.title,
                 content_hash=source.content_hash,
+                domain_type=source.domain_type,
+                reliability_score=source.reliability_score,
+                published_at=_parse_datetime(source.published_at),
             )
             await session.commit()
             return str(created.id), True
@@ -161,14 +173,81 @@ class SqlResearchStore:
             await PassageRepository(session).create_batch(items)
             await session.commit()
 
+    async def save_claims(self, *, run_id: str, claims: list[ClaimItem]) -> None:
+        """All claims and their evidence links in one transaction."""
+        if not claims:
+            return
+        run_uuid = _uuid(run_id)
+        async with self._session_factory() as session:
+            for claim in claims:
+                if not claim.evidence:
+                    raise ValueError(f"claim {claim.id!r} has no evidence")
+                claim_uuid = _uuid(claim.id)
+                session.add(
+                    Claim(
+                        id=claim_uuid,
+                        run_id=run_uuid,
+                        sub_question_id=(
+                            _uuid(claim.sub_question_id) if claim.sub_question_id else None
+                        ),
+                        text=claim.text,
+                        verdict=claim.verdict,
+                        confidence=claim.confidence,
+                    )
+                )
+                seen: set[str] = set()
+                for link in claim.evidence:
+                    if link.passage_id in seen:
+                        continue
+                    seen.add(link.passage_id)
+                    session.add(
+                        ClaimEvidence(
+                            claim_id=claim_uuid,
+                            passage_id=_uuid(link.passage_id),
+                            stance=link.stance,
+                        )
+                    )
+            await session.commit()
+
+    async def save_contradictions(
+        self, *, run_id: str, contradictions: list[ContradictionItem]
+    ) -> None:
+        """All contradictions and their claim links in one transaction."""
+        if not contradictions:
+            return
+        run_uuid = _uuid(run_id)
+        async with self._session_factory() as session:
+            for item in contradictions:
+                claim_ids = list(dict.fromkeys(item.claim_ids))
+                if len(claim_ids) < 2:
+                    raise ValueError(f"contradiction {item.id!r} needs two claims")
+                contradiction_uuid = _uuid(item.id)
+                session.add(
+                    Contradiction(
+                        id=contradiction_uuid,
+                        run_id=run_uuid,
+                        explanation=item.explanation,
+                        # The cause category; "resolved" follows from it
+                        # (ScoringConfig.resolved_causes).
+                        likely_cause=item.likely_cause,
+                    )
+                )
+                for claim_id in claim_ids:
+                    session.add(
+                        ContradictionClaim(
+                            contradiction_id=contradiction_uuid, claim_id=_uuid(claim_id)
+                        )
+                    )
+            await session.commit()
+
     async def save_report(self, *, run_id: str, report: ResearchReport, markdown: str) -> str:
         async with self._session_factory() as session:
             row = await ReportRepository(session).create(
                 run_id=_uuid(run_id),
                 content=report.model_dump(mode="json"),
                 markdown=markdown,
-                # The column is NOT NULL, and confidence is unscored until M5,
-                # so 0.0 is stored here; the content JSON keeps null.
+                # The column is NOT NULL; quick-mode reports have no confidence
+                # (null in the content JSON), so 0.0 is stored for them.
                 overall_confidence=report.overall_confidence or 0.0,
                 version=1,
             )
@@ -191,6 +270,17 @@ class SqlResearchStore:
         async with self._session_factory() as session:
             sources = await SourceRepository(session).list_by_run(_uuid(run_id))
             return {str(source.id) for source in sources}
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        logger.debug("Ignoring unparseable published_at %r", value)
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def make_session_vector_search_fn(

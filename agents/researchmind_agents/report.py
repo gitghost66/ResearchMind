@@ -9,6 +9,11 @@ Grounding is enforced by construction:
   without a valid citation;
 * :func:`render_markdown` writes the markdown from the validated structure, so
   every ``[S#]`` marker in it maps to a listed, stored source.
+
+In verified modes the model cites claim labels (``C1``, ``C2``, ...) instead;
+the same helpers run with ``prefix="C"``, and the synthesizer then derives
+each statement's source labels from its claims. A decision-mode
+recommendation is checked like any other statements.
 """
 
 from __future__ import annotations
@@ -36,23 +41,29 @@ __all__ = [
     "render_markdown",
 ]
 
-_LABEL = re.compile(r"^S(\d+)$", re.IGNORECASE)
-# "[S1]", "[S1, S2]", "[S1][S3]" written into the sentence itself.
-_INLINE_MARKERS = re.compile(r"\s*\[\s*(S\d+(?:\s*[,;]\s*S\d+)*)\s*\]", re.IGNORECASE)
+_ANY_LABEL = re.compile(r"^([A-Z])(\d+)$", re.IGNORECASE)
 
 
-def normalize_label(raw: str) -> str | None:
+def _inline_markers(prefix: str) -> re.Pattern[str]:
+    # "[S1]", "[S1, S2]", "[S1][S3]" written into the sentence itself.
+    p = re.escape(prefix)
+    return re.compile(rf"\s*\[\s*({p}\d+(?:\s*[,;]\s*{p}\d+)*)\s*\]", re.IGNORECASE)
+
+
+def normalize_label(raw: str, prefix: str = "S") -> str | None:
     """``"[s3]"`` / ``" S3 "`` -> ``"S3"``; anything not shaped like a label -> ``None``."""
-    match = _LABEL.match(raw.strip().strip("[]()").strip())
-    return f"S{int(match.group(1))}" if match else None
+    match = _ANY_LABEL.match(raw.strip().strip("[]()").strip())
+    if not match or match.group(1).upper() != prefix.upper():
+        return None
+    return f"{prefix.upper()}{int(match.group(2))}"
 
 
 def label_sort_key(label: str) -> int:
-    match = _LABEL.match(label)
-    return int(match.group(1)) if match else 10**9
+    match = _ANY_LABEL.match(label)
+    return int(match.group(2)) if match else 10**9
 
 
-def clean_statement(statement: ReportStatement) -> ReportStatement:
+def clean_statement(statement: ReportStatement, prefix: str = "S") -> ReportStatement:
     """
     Move citation markers the model wrote inline into ``citations`` and
     normalise every label. Unparseable labels are kept verbatim so the check
@@ -64,27 +75,28 @@ def clean_statement(statement: ReportStatement) -> ReportStatement:
         inline.extend(part.strip() for part in re.split(r"[,;]", match.group(1)))
         return ""
 
-    text = _INLINE_MARKERS.sub(collect, statement.text).strip()
+    text = _inline_markers(prefix).sub(collect, statement.text).strip()
     labels: list[str] = []
     for raw in [*statement.citations, *inline]:
-        label = normalize_label(raw) or raw.strip()
+        label = normalize_label(raw, prefix) or raw.strip()
         if label and label not in labels:
             labels.append(label)
     return ReportStatement(text=text, citations=labels)
 
 
-def normalize_output(output: ReportOutput) -> ReportOutput:
+def normalize_output(output: ReportOutput, prefix: str = "S") -> ReportOutput:
     return ReportOutput(
         title=" ".join(output.title.split()),
-        executive_summary=[clean_statement(s) for s in output.executive_summary],
+        executive_summary=[clean_statement(s, prefix) for s in output.executive_summary],
         sections=[
             ReportSection(
                 heading=" ".join(section.heading.split()),
-                statements=[clean_statement(s) for s in section.statements],
+                statements=[clean_statement(s, prefix) for s in section.statements],
             )
             for section in output.sections
         ],
         limitations=[" ".join(item.split()) for item in output.limitations if item.strip()],
+        recommendation=[clean_statement(s, prefix) for s in output.recommendation],
     )
 
 
@@ -102,6 +114,7 @@ def _statements(output: ReportOutput) -> Iterable[ReportStatement]:
     yield from output.executive_summary
     for section in output.sections:
         yield from section.statements
+    yield from output.recommendation
 
 
 def check_citations(output: ReportOutput, allowed: set[str]) -> CitationCheck:
@@ -130,7 +143,9 @@ def enforce_citations(output: ReportOutput, allowed: set[str]) -> tuple[ReportOu
         for statement in statements:
             labels = [label for label in statement.citations if label in allowed]
             if statement.text and labels:
-                kept.append(ReportStatement(text=statement.text, citations=labels))
+                kept.append(
+                    ReportStatement(text=statement.text, citations=labels, claims=statement.claims)
+                )
             elif statement.text:
                 dropped += 1
         return kept
@@ -146,6 +161,7 @@ def enforce_citations(output: ReportOutput, allowed: set[str]) -> tuple[ReportOu
         executive_summary=keep(output.executive_summary),
         sections=sections,
         limitations=output.limitations,
+        recommendation=keep(output.recommendation),
     )
     return cleaned, dropped
 
@@ -166,12 +182,29 @@ def _cite(statement: ReportStatement) -> str:
     return f"{statement.text} {markers}".strip()
 
 
+_VERDICT_TEXT = {
+    "supported": "supported",
+    "weak": "weakly supported",
+    "mixed": "sources disagree",
+    "unsupported": "unsupported",
+    "unverified": "not verified",
+}
+
+
 def render_markdown(report: ResearchReport) -> str:
     """
     Render the report. Citation markers appear only as ``[S#]`` in the body;
     the source list uses bare labels so it is never mistaken for a citation.
     """
-    lines = [f"# {report.title}", "", f"> **Question:** {report.question}", ""]
+    lines = [f"# {report.title}", "", f"> **Question:** {report.question}"]
+    if report.overall_confidence is not None:
+        checked = int(report.verification.get("claims_checked", len(report.key_findings)))
+        lines += [
+            ">",
+            f"> **Overall confidence:** {report.overall_confidence:.2f} "
+            f"(from {len(report.key_findings)} verified claims; {checked} checked)",
+        ]
+    lines.append("")
 
     if report.executive_summary:
         lines += ["## Executive summary", ""]
@@ -183,6 +216,36 @@ def render_markdown(report: ResearchReport) -> str:
 
     if not report.executive_summary and not report.sections:
         lines += ["_No findings could be grounded in the sources that were found._", ""]
+
+    if report.mode == "decision" or report.recommendation:
+        lines += ["## Recommendation", ""]
+        if report.recommendation:
+            lines += [" ".join(_cite(s) for s in report.recommendation), ""]
+        else:
+            lines += ["_No recommendation could be grounded in the verified claims._", ""]
+
+    if report.key_findings:
+        lines += ["## Key findings", ""]
+        for claim in report.key_findings:
+            markers = "".join(f"[{label}]" for label in claim.citations)
+            verdict = _VERDICT_TEXT.get(claim.verdict, claim.verdict)
+            lines.append(
+                f"- **{claim.label}** {claim.text} {markers} "
+                f"_({verdict}; confidence {claim.confidence:.2f})_".replace("  ", " ")
+            )
+        lines.append("")
+
+    if report.contradictory_evidence:
+        lines += ["## Contradictory evidence", ""]
+        for item in report.contradictory_evidence:
+            markers = "".join(f"[{label}]" for label in item.citations)
+            status = "resolved" if item.resolved else "unresolved"
+            cause = item.likely_cause.replace("_", " ")
+            lines.append(
+                f"- **{item.label}** {' vs '.join(item.claims)}: {item.explanation} {markers} "
+                f"_(likely cause: {cause}; {status})_".replace("  ", " ")
+            )
+        lines.append("")
 
     if report.limitations:
         lines += ["## Limitations", ""]

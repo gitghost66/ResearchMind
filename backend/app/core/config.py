@@ -108,6 +108,8 @@ class Settings(BaseSettings):
     sse_retry_ms: int = 3000
 
     # --- Research defaults ---
+    # Research rounds in deep, academic, and decision modes: the first plus up
+    # to max_iterations - 1 gap-filling rounds. Quick mode always runs one.
     max_iterations: int = 3
     # Search results requested per query.
     max_sources_per_question: int = 10
@@ -118,9 +120,15 @@ class Settings(BaseSettings):
     concurrency_cap: int = 4
 
     # --- Planner ---
+    # Quick mode.
     planner_min_sub_questions: int = 2
     planner_max_sub_questions: int = 5
     planner_max_queries_per_sub_question: int = 3
+    # Deep, academic, and decision modes (PRD: 4-8 sub-questions).
+    planner_verified_min_sub_questions: int = 4
+    planner_verified_max_sub_questions: int = 8
+    # Gap-filling rounds: most new sub-questions per round.
+    planner_max_gap_sub_questions: int = 3
 
     # --- Web research ---
     research_pages_per_sub_question: int = 4
@@ -135,6 +143,90 @@ class Settings(BaseSettings):
     synth_max_passages: int = 24
     synth_max_output_tokens: int = 8192
     synth_min_similarity: float = 0.0
+    # Verified modes: claims shown to the model, and the lowest claim
+    # confidence a report may use.
+    synth_max_claims: int = 40
+    synth_min_claim_confidence: float = 0.0
+
+    # --- Academic research (arXiv, Semantic Scholar) ---
+    academic_search_providers: str = "arxiv,semantic_scholar"
+    # Papers requested per query from each provider.
+    academic_max_results: int = 8
+    academic_search_timeout: float = 20.0
+    arxiv_api_url: str = "https://export.arxiv.org/api/query"
+    # arXiv asks for three seconds between API requests.
+    arxiv_min_interval_seconds: float = 3.0
+    semantic_scholar_api_url: str = "https://api.semanticscholar.org/graph/v1/paper/search"
+    # Optional; without it requests share a public, heavily rate-limited pool.
+    semantic_scholar_api_key: str = ""
+    semantic_scholar_min_interval_seconds: float = 1.0
+    # Papers whose abstract is shorter than this are skipped.
+    min_abstract_chars: int = 200
+
+    # --- Claim extraction ---
+    claims_passages_per_sub_question: int = 5
+    claims_max_passages: int = 24
+    claims_max_per_sub_question: int = 8
+    claims_max_output_tokens: int = 4096
+
+    # --- Fact checking ---
+    # Passages per claim: its own, then similar passages from other sources.
+    fact_check_evidence_per_claim: int = 4
+    fact_check_min_similarity: float = 0.0
+    # Characters of each passage the fact checker reads.
+    fact_check_excerpt_chars: int = 700
+    # Claims per model call.
+    fact_check_batch_size: int = 6
+    fact_check_max_output_tokens: int = 4096
+
+    # --- Contradiction detection ---
+    # Claim pairs at least this similar (cosine) are compared by the model;
+    # pairs the fact checker linked are always compared.
+    contradiction_min_similarity: float = 0.7
+    # Most pairs compared per round (most similar first), claims per topic,
+    # and topics per model call.
+    contradiction_max_pairs: int = 40
+    contradiction_max_group_size: int = 6
+    contradiction_groups_per_call: int = 4
+    contradiction_excerpts_per_claim: int = 2
+    contradiction_max_output_tokens: int = 4096
+
+    # --- Sufficiency check and the gap-filling loop ---
+    # A sub-question is covered with this many usable claims from this many
+    # independent sites; otherwise it is a gap.
+    sufficiency_min_claims_per_sub_question: int = 2
+    sufficiency_min_sites_per_sub_question: int = 2
+    # When every sub-question is covered, the model judges what is missing.
+    sufficiency_llm_check: bool = True
+    sufficiency_max_gaps: int = 3
+    sufficiency_claims_shown_per_sub_question: int = 6
+    sufficiency_max_output_tokens: int = 2048
+    # Seconds into a run after which no new round starts, per mode, as JSON;
+    # merged over the defaults ({"deep": 150, "academic": 180, "decision": 150}).
+    # 0 turns a mode's deadline off.
+    loop_deadline_seconds: dict[str, float] = {}
+
+    # --- Scoring (PRD s8; formulas in agents/researchmind_agents/reliability.py) ---
+    # Base reliability per domain type, as JSON; merged over the defaults,
+    # e.g. {"forum": 0.25, "news": 0.75}.
+    reliability_type_scores: dict[str, float] = {}
+    reliability_recency_full_years: float = 3.0
+    reliability_recency_penalty_per_year: float = 0.05
+    reliability_recency_floor: float = 0.75
+    reliability_unknown_date_factor: float = 0.95
+    reliability_citation_bonus_max: float = 0.10
+    reliability_citation_saturation: int = 1000
+    reliability_methodology_bonus: float = 0.05
+    # Claim confidence multiplier per verdict, as JSON; merged over the defaults.
+    confidence_verdict_weights: dict[str, float] = {}
+    # Most one fully reliable source establishes alone (noisy-OR across sources).
+    confidence_source_weight: float = 0.8
+    confidence_uncovered_penalty: float = 0.5
+    confidence_contradiction_penalty: float = 0.10
+    confidence_contradiction_penalty_cap: float = 0.5
+    # Likely causes under which a contradiction is resolved (the claims differ
+    # in scope), comma-separated; other contradictions lower the confidence.
+    confidence_resolved_causes: str = "conditions,date,version,dataset,definition"
 
     # --- Cost control ---
     # 0 disables a limit.

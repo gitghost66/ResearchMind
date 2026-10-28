@@ -1,10 +1,12 @@
 # ResearchMind — Master Implementation Plan
 
 > **Status:** Active implementation
-> **Done:** M0, M1, M2, M4 (offline acceptance; live check pending migration 0003 on Supabase)
-> **Open:** M3 seed eval (needs a live `GEMINI_API_KEY` run)
-> **Next:** M5 — specialised agents and verification
-> **Last updated:** 2026-10-27
+> **Done:** M0, M1, M2, M4, M5, M6 (offline acceptance; live checks pending: migration 0003 on
+> Supabase, the M5 verification eval, and the M6 contradiction eval and latency targets)
+> **Open:** M3 seed eval, M5 verification eval, M6 contradiction eval and per-mode latency
+> (all need a live `GEMINI_API_KEY` run)
+> **Next:** M7 — evaluation framework
+> **Last updated:** 2026-10-28
 >
 > This is the single source of truth for the roadmap. `ResearchMind_PRD.md` holds
 > product requirements; `AGENTS.md` holds the rules every contributor/agent follows.
@@ -272,20 +274,72 @@ and its **Done when** criteria met.
 
 ---
 
-### 📋 M5 — Specialised agents & verification
+### ✅ M5 — Specialised agents & verification
 
 - Researchers: `TechnicalResearcher`, `MarketResearcher`, `AcademicResearcher` (arXiv, Semantic Scholar).
 - **ClaimExtractor** — atomic claims linked to passage IDs.
 - **FactChecker** — verdict (`supported` / `weak` / `unsupported` / `mixed`) per claim against its evidence.
 - **Scoring (`reliability.py`)**
-  - Source reliability (0–1): domain type, recency, authority. Domain-type classification from a versioned list in `agents/researchmind_agents/data/domains.yaml` plus TLD rules.
+  - Source reliability (0–1): domain type, recency, authority. Domain-type classification from a versioned list in `agents/researchmind_agents/data/domains.json` plus TLD rules.
   - Claim confidence (0–1): source reliability × independent corroboration × verdict.
 
-**Done when:** on 20 hand-labelled claims, verdict agreement ≥ 80% and confidence within ±0.15 of the label; scoring functions have pure unit tests.
+**Done when**
+- [x] Scoring functions have pure unit tests (`test_reliability.py`).
+- [x] Claims always link to passages (`test_graph.py::TestVerifiedModes`, `test_api_research.py::TestVerifiedRun`).
+- [x] The report includes verdicts and confidence (key findings + `overall_confidence`, deep and academic).
+- [x] 20 hand-labelled claims (`evals/claims_gold.jsonl`); with the labelled stances, scoring reproduces
+  every verdict and every confidence within ±0.15 (MAE 0.022) — `test_check_verification.py`.
+- [ ] Live: verdict agreement ≥ 80% and confidence within ±0.15 for ≥ 80% of the gold claims, with the
+  real model — `backend/scripts/eval_verification.py`.
+
+**As built (2026-10-27)**
+- **Modes:** `deep` (web, technical, market researchers) and `academic` (adds the academic researcher,
+  favoured) run the verified pipeline, single pass. `quick` is unchanged and unverified. `decision`,
+  contradictions, and the loop stay in M6. Modes live in `modes.py`; the graph is compiled per mode
+  (`build_research_graph(runtime, mode=...)`), and `pipeline_steps(mode)` drives API progress.
+- **Routing:** the planner (prompt v2) tags each sub-question with a domain from those the mode allows;
+  unknown or disallowed domains fall back to the mode's default, and a mode that favours a domain gets at
+  least one sub-question in it. `PlannedSubQuestion.domain` is the one optional field in an LLM schema
+  (defaults to `web`), so quick-mode plans and older outputs still validate.
+- **Specialists:** web, technical, and market are one pipeline with a `ResearcherProfile`: agent name
+  (events and usage), selection guidance, and source types read first when the model's picks run out.
+  Search results show each site's type to the model.
+- **Academic:** `tools/scholarly.py` queries arXiv (Atom XML) and Semantic Scholar (JSON) over httpx with
+  per-provider request spacing, a byte cap, retries, a TTL cache, and merge/dedupe by arXiv ID / DOI /
+  title. Papers are stored as sources whose text is title + abstract (no page fetch); typed
+  `peer_reviewed` with a venue, else `preprint`. With no usable papers the branch falls back to web
+  research that prefers journals, archives, and `.edu` sites.
+- **Claim extraction:** passages are retrieved per sub-question with the synthesizer's retrieval (moved
+  to `nodes/retrieval.py`), each read once for its best-matching sub-question; one call per
+  sub-question. The model cites passage labels (`P1`…); claims without a valid label are dropped;
+  identical wording is merged with all its passages.
+- **Fact checking:** each claim is checked against its own passages plus similar passages from other
+  sources (vector search, new sources first), as excerpts around the claim (`tools/excerpts.py`, 700
+  chars) — a check reads a few sentences, not whole chunks. The model returns a verdict and a stance per
+  excerpt; `reconcile_verdict` makes the verdict agree with the stances (no support → unsupported; any
+  contradiction → mixed). Claims the model did not judge are stored `unverified`, confidence 0. Claims
+  and `claim_evidence` rows are written in one transaction; `claim_verified` is streamed per claim.
+- **Scoring:** weights are `ScoringConfig` fields set from `RELIABILITY_*` / `CONFIDENCE_*` settings
+  (type and verdict tables as JSON overrides). Corroboration is a noisy-OR over independent sites with
+  `source_weight` 0.8 — a first draft let one highly cited paper score 1.0 on its own; now a single source
+  reaches at most 0.8 × its reliability. `domains.json` replaced the planned `domains.yaml` to avoid adding
+  PyYAML. Sources are scored in every mode (the `/sources` endpoint shows them); `published_at` comes from
+  page meta tags / JSON-LD or the paper index.
+- **Synthesis:** verified modes write from usable claims only (`C1`…), and each statement's source labels
+  are derived from its claims (`ReportStatement.claims`, hidden from the model's schema). The report adds
+  `key_findings` (verdict, confidence, citations, evidence with stance and excerpt), `verification`
+  counts, and `overall_confidence`. If no claim is usable the report falls back to passages with a
+  limitation and no confidence; on model failure it lists the claims extractively.
+- **Gold set:** the 20 claims use fictional products and studies on `.example` hosts, so the model cannot
+  answer from memory and no text is attributed to a real organisation. Labels: 8 supported, 4 weak,
+  4 mixed, 4 unsupported. They are hand-written — spot-check them before relying on the live numbers.
+- **Not yet:** contradiction records and the penalty they feed (`unresolved_contradictions` is 0 until
+  M6); per-mode planner bounds (PRD's 4–8 sub-questions for deep) and latency targets are M6.
+  (All three landed in M6.)
 
 ---
 
-### 📋 M6 — Contradictions, loop, evidence graph, modes
+### ✅ M6 — Contradictions, loop, evidence graph, modes
 
 - **ContradictionDetector** — opposing claims on the same topic plus a likely cause (conditions, dates, versions, datasets).
 - **SufficiencyChecker** — if gaps remain and `iteration < max_iterations` and budget allows, loop to the planner with gap-filling sub-questions.
@@ -299,7 +353,78 @@ and its **Done when** criteria met.
   | `academic` | all, academic first | ≤ 3 | ~6 min |
   | `decision` | all, market first, mandatory recommendation | ≤ 3 | ~5 min |
 
-**Done when:** each mode meets its latency target on the seed eval at p50; contradiction detection finds ≥ 70% of seeded contradictions.
+**Done when**
+- [x] A seeded conflicting-source run produces a contradiction with its cause; the detector saw the
+  dates that explain it (`test_graph.py::TestContradictions`).
+- [x] The loop terminates at `max_iterations` with gaps in every round (`test_graph.py::TestLoop`),
+  and five rounds fit the recursion limit.
+- [x] The graph payload validates against its schema (`backend/tests/test_api_graph.py`).
+- [x] Contradiction gold set: 15 cases, 14 seeded contradictions across all seven causes, 3 cases with
+  none. With the labelled answers, the harness finds 14/14 with no false positives
+  (`test_check_contradictions.py`).
+- [ ] Live: contradiction detection finds ≥ 70% of the seeded contradictions —
+  `backend/scripts/eval_contradictions.py`.
+- [ ] Live: each mode meets its latency target at p50 on the seed eval.
+
+**As built (2026-10-28)**
+- **Graph:** verified modes are now `... -> fact_checker -> contradiction_detector -> sufficiency_checker`,
+  which routes back to the planner or on to the synthesizer. Each pass is a research round
+  (`iteration` 0, 1, ...). Only the round's new sub-questions fan out; a gap round that adds nothing
+  goes straight to the synthesizer. `run_research` sets `max_iterations` from `MAX_ITERATIONS` for
+  looping modes (quick runs one), and the run config's `recursion_limit` grows with it.
+- **Rounds stay incremental:** sub-questions and claims record their round. The claim extractor reads
+  only the round's sub-questions and passages no earlier round read (`extracted_passage_ids`; the
+  retrieval asks for extra hits to make up for skipped ones) and drops claims worded like earlier
+  ones. The fact checker checks and stores only the round's claims; earlier verdicts stand. The
+  detector compares pairs with at least one new claim. Nothing is re-checked.
+- **Gap-filling planner** (`planner_gaps/v1`, its own `GapPlanOutput` schema): sees the sub-questions
+  with their coverage and the queries already tried, plus the gaps (fenced as untrusted data — model
+  gaps derive from web text). It proposes at most `PLANNER_MAX_GAP_SUB_QUESTIONS`; repeats of
+  sub-questions or tried queries are dropped. A sub-question filling a sub-question's gap gets
+  `parent_id`, and coverage, report sections, and confidence count it toward that top-level
+  sub-question — otherwise a filled gap would stay "uncovered" forever. Rows are stored with
+  `save_plan(iteration=...)`, which also sets `research_runs.iteration`; the plan JSON keeps every
+  sub-question plus a `rounds` log. Model failure, a spent budget, or a failed store add nothing.
+- **Sufficiency** (`coverage.py`, `nodes/sufficiency.py`): rules first — each top-level sub-question
+  needs `SUFFICIENCY_MIN_CLAIMS_PER_SUB_QUESTION` (2) usable claims from
+  `SUFFICIENCY_MIN_SITES_PER_SUB_QUESTION` (2) independent sites. Only when the rules pass and
+  another round could follow does the model judge (`sufficiency/v1`), naming up to
+  `SUFFICIENCY_MAX_GAPS` missing aspects; unresolved contradictions are shown to it. A round may start
+  only below `max_iterations`, with research budget left, and before the mode's
+  `LOOP_DEADLINE_SECONDS` (deep 150 s, academic 180 s, decision 150 s: half the latency targets).
+  Gaps left when the loop stops become report limitations.
+- **Contradictions** (`contradiction_detector/v1`): candidates are deterministic — usable claim pairs
+  with cosine ≥ `CONTRADICTION_MIN_SIMILARITY` (0.7) or linked by the fact checker (one claim's
+  passage contradicts the other), skipping pairs from one passage; at most `CONTRADICTION_MAX_PAIRS`,
+  linked first. Pairs are joined into topics of ≤ `CONTRADICTION_MAX_GROUP_SIZE` claims, several per
+  call. Each claim is shown with its supporting excerpts and their sources' type and date. A record
+  needs two or more claims of one topic. Causes: `conditions`, `date`, `version`, `dataset`,
+  `methodology`, `definition`, `unexplained`; *resolved* is decided by code from
+  `CONFIDENCE_RESOLVED_CAUSES` (default: the first four and `definition` — the claims differ in scope).
+  Records go to `contradictions` / `contradiction_claims` (no migration needed: M1 created the
+  tables; `likely_cause` holds the category).
+- **Report:** `contradictory_evidence` (X1, ... with claim labels, citations, cause, resolved) and, in
+  decision mode, `recommendation`. Claims in a contradiction are always among the labelled claims, so
+  both sides can be shown. Overall confidence now applies the unresolved-contradiction penalty
+  (`CONFIDENCE_CONTRADICTION_PENALTY` each, up to the cap). The verified prompt is
+  `synthesizer_verified/v2` (contradictions, user context); decision mode uses
+  `synthesizer_decision/v1`, whose recommendation is required: a missing one triggers the citation
+  retry, then a limitation.
+- **Modes:** `decision` offers every researcher with market favoured (PRD "All"; the academic
+  researcher only gets sub-questions tagged `academic`). The first plan asks for 2–5 sub-questions in
+  quick mode and `PLANNER_VERIFIED_MIN/MAX_SUB_QUESTIONS` (4–8) otherwise.
+- **Evidence graph** (`app/schemas/graph.py`, `app/services/evidence_graph.py`): typed nodes
+  (per-type `meta`, so claim nodes always carry verdict and confidence) and `{id, from, to, type,
+  meta}` edges; the model rejects duplicate IDs and dangling edges. Includes passages linked as
+  supporting or contradicting evidence plus the report's cited passages (all a quick run has), their
+  sources, and every report-cited source. Built from stored rows, so it works mid-run.
+- **Contradiction eval:** `evals/contradictions_gold.jsonl` (synthetic, `.example` hosts) and
+  `evals/check_contradictions.py` report recall, cause agreement, precision, false positives, and
+  candidate recall. Offline, the bag-of-words fake embeddings miss two paraphrased pairs at 0.7
+  (12/14 candidates); the harness test uses 0.45 and finds 14/14. The live script reports the real
+  candidate recall for tuning the threshold.
+- **Not yet:** live runs of the contradiction eval and the per-mode latency check; LLM-call tracing
+  spans (M4 note) and checkpoint resume (M8) are unchanged.
 
 ---
 
