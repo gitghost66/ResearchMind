@@ -20,6 +20,7 @@ from researchmind_agents.config import (
     ClaimsConfig,
     ContradictionConfig,
     EmbeddingConfig,
+    EvalConfig,
     FactCheckConfig,
     LLMConfig,
     PageExtractConfig,
@@ -597,3 +598,52 @@ class TestM6Config:
 
         assert set(get_args(ContradictionCause)) == set(CONTRADICTION_CAUSES)
         assert set(CAUSE_DESCRIPTIONS) == set(CONTRADICTION_CAUSES)
+
+
+# ===========================================================================
+# M7: evaluation settings
+# ===========================================================================
+
+
+class TestM7Config:
+    def test_defaults(self) -> None:
+        config = AgentConfig.from_mapping({})
+        assert config.eval == EvalConfig()
+        assert config.eval.judge_model == "", "empty: the judge uses the research model"
+        assert config.eval.retrieval_k == (5, 10)
+
+    def test_mapping_carries_every_eval_setting(self) -> None:
+        config = AgentConfig.from_mapping(
+            {
+                "eval_judge_model": "judge-model",
+                "eval_retrieval_k": "10, 3,3",
+                "eval_rag_pages": 4,
+                "eval_rag_top_k": 9,
+                "eval_judge_batch_size": 2,
+                "eval_judge_excerpt_chars": 500,
+                "eval_max_statements": 12,
+                "eval_baseline_max_urls": 5,
+                "eval_spot_check_sample": 15,
+                "eval_max_output_tokens": 1000,
+            }
+        )
+        assert config.eval == EvalConfig(
+            judge_model="judge-model",
+            retrieval_k=(3, 10),
+            rag_pages=4,
+            rag_top_k=9,
+            judge_batch_size=2,
+            judge_excerpt_chars=500,
+            max_statements=12,
+            baseline_max_urls=5,
+            spot_check_sample=15,
+            max_output_tokens=1000,
+        )
+
+    def test_cutoffs_from_a_list(self) -> None:
+        assert AgentConfig.from_mapping({"eval_retrieval_k": [20, 1]}).eval.retrieval_k == (1, 20)
+
+    @pytest.mark.parametrize("value", ["0,5", "", ","])
+    def test_bad_cutoffs_fail_at_startup(self, value: str) -> None:
+        with pytest.raises(ValueError, match="retrieval_k"):
+            AgentConfig.from_mapping({"eval_retrieval_k": value})

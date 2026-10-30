@@ -8,6 +8,11 @@ Security measures (PRD s10):
   into a private, loopback, link-local, or cloud-metadata range. Redirects are
   followed manually so each hop is checked; letting httpx follow them would
   mean only the first URL was ever validated.
+* **Pinned connections** — the check is repeated where the socket is opened
+  (:class:`PinnedNetworkBackend`): the host is resolved once, every address
+  is vetted, and the connection goes to a vetted address. A DNS answer that
+  changes between the check and the connect (DNS rebinding) cannot reach a
+  private address. TLS still verifies the certificate against the hostname.
 * **Streaming size cap** — the body is read incrementally and abandoned once the
   cap is hit, so a huge response can never be buffered in full.
 * **Content-type allowlist** — binary payloads are rejected before parsing.
@@ -31,12 +36,14 @@ import logging
 import re
 import socket
 import time
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
+import httpcore
 import httpx
 from bs4 import BeautifulSoup
 
@@ -47,9 +54,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "PageContent",
     "PageExtractTool",
+    "PinnedNetworkBackend",
     "SSRFError",
     "RobotsDisallowedError",
     "parse_published_date",
+    "pinned_transport",
 ]
 
 # ---------------------------------------------------------------------------
@@ -261,10 +270,9 @@ class PageExtractTool:
         Every address is checked, not just the first, so a host with one public
         and one private record cannot slip through.
 
-        Note: a determined attacker controlling DNS could still rebind between
-        this check and the connection. Closing that fully requires pinning the
-        connection to a vetted IP; the exposure here is limited to outbound GETs
-        whose bodies are only ever returned as text.
+        This early check gives a clear error before any request. It is not
+        what stops DNS rebinding: :class:`PinnedNetworkBackend` checks again
+        when the connection is opened and connects to the address it checked.
         """
         hostname = urlparse(url).hostname or ""
         if _as_ip(hostname) is not None:
@@ -355,6 +363,7 @@ class PageExtractTool:
             self._client = httpx.AsyncClient(
                 timeout=self._config.timeout,
                 follow_redirects=False,
+                transport=pinned_transport(),
             )
         return self._client
 
@@ -469,6 +478,115 @@ class PageExtractTool:
     def _clean_html(html: str) -> dict[str, str]:
         """Parse HTML and return ``{"title": ..., "text": ..., "published_at": ...}``."""
         return _clean_html(html)
+
+
+# ---------------------------------------------------------------------------
+# Pinned connections
+# ---------------------------------------------------------------------------
+
+# (host, port) -> the addresses it resolves to.
+Resolver = Callable[[str, int], Awaitable[list[str]]]
+
+
+async def _system_resolve(host: str, port: int) -> list[str]:
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return list(dict.fromkeys(str(info[4][0]) for info in infos))
+
+
+class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
+    """
+    Opens TCP connections only to vetted public addresses.
+
+    ``connect_tcp`` resolves the host itself, rejects it with
+    :class:`SSRFError` if *any* address is blocked, and connects to the
+    addresses it just vetted, in order. httpcore then starts TLS with the
+    original hostname, so certificate checks are unchanged. Unix sockets are
+    refused.
+    """
+
+    def __init__(
+        self,
+        inner: httpcore.AsyncNetworkBackend | None = None,
+        *,
+        resolve: Resolver | None = None,
+    ) -> None:
+        self._inner = inner or httpcore.AnyIOBackend()
+        self._resolve = resolve or _system_resolve
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[Any] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        literal = _as_ip(host)
+        if literal is not None:
+            addresses = [str(literal)]
+        else:
+            try:
+                async with asyncio.timeout(timeout):
+                    addresses = await self._resolve(host, port)
+            except (OSError, TimeoutError) as exc:
+                raise httpcore.ConnectError(f"DNS resolution failed for {host!r}: {exc}") from exc
+        if not addresses:
+            raise httpcore.ConnectError(f"DNS returned no addresses for {host!r}")
+        for address in addresses:
+            ip = _as_ip(address)
+            if ip is None:
+                raise SSRFError(f"{host!r} resolves to unparseable address {address!r}")
+            blocked = _blocked_network(ip)
+            if blocked is not None:
+                raise SSRFError(f"{host!r} resolves to {address} in blocked range {blocked}")
+
+        error: Exception | None = None
+        for address in addresses:
+            try:
+                return await self._inner.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except (httpcore.ConnectError, httpcore.ConnectTimeout, OSError) as exc:
+                error = exc
+        assert error is not None
+        raise error
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[Any] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        raise SSRFError("Unix socket connections are not allowed")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def pinned_transport(
+    backend: httpcore.AsyncNetworkBackend | None = None,
+) -> httpx.AsyncHTTPTransport:
+    """
+    An httpx transport whose connections go through *backend* (a
+    :class:`PinnedNetworkBackend` by default). Environment proxies are
+    ignored: a proxy would resolve the host itself, undoing the pin.
+
+    httpx has no public hook for httpcore's network backend, so the
+    transport's connection pool is replaced; a test guards this.
+    """
+    transport = httpx.AsyncHTTPTransport(trust_env=False)
+    transport._pool = httpcore.AsyncConnectionPool(
+        ssl_context=httpx.create_ssl_context(trust_env=False),
+        max_connections=100,
+        max_keepalive_connections=20,
+        keepalive_expiry=5.0,
+        network_backend=backend or PinnedNetworkBackend(),
+    )
+    return transport
 
 
 # ---------------------------------------------------------------------------

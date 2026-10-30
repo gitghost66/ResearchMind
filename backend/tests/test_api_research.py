@@ -1,7 +1,7 @@
 """
-M4 tests — the research API over HTTP, end to end.
+M4 tests — the research API over HTTP, end to end (M8: with a worker in the process).
 
-The real app, services, and background job runner run against a SQLite file;
+The real app, services, and in-process worker run against a SQLite file;
 the agents' fakes replace the LLM, search, pages, and embeddings (AGENTS.md
 rule 7). The ``gate`` on the harness holds a run at its first model call (the
 planner's), which is how a run is caught "running" for the cancel, progress,
@@ -20,18 +20,20 @@ import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 
+from app.container import build_worker_services
 from app.main import create_app
 from app.models.claims import Claim, ClaimEvidence
 from app.models.evidence import Passage, Source
 from app.models.research import LLMUsage, Report, ResearchRun, RunEvent, SubQuestion
 from app.services import research_service
-from app.services.run_events import INTERRUPTED_ERROR
+from app.services.run_queue import gave_up_error
 
 from .conftest import ApiHarness, make_test_settings
 
@@ -297,14 +299,16 @@ class TestRead:
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "validation_error"
 
-    async def test_an_error_marking_the_run_running_still_ends_it(
+    async def test_a_failed_claim_leaves_the_run_queued_for_the_next_try(
         self, api: ApiHarness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         recorder = api.services.recorder
         real = recorder.transition
+        failures = {"running": 1}
 
         async def flaky(run_id: str, status: str, **kwargs: Any) -> bool:
-            if status == "running":
+            if failures.get(status):
+                failures[status] -= 1
                 raise RuntimeError("connection reset")
             return await real(run_id, status, **kwargs)
 
@@ -312,8 +316,9 @@ class TestRead:
         run_id = await api.create()
 
         detail = await api.wait_for(run_id)
-        assert detail["status"] == "failed"
-        assert detail["error"] == "RuntimeError: connection reset"
+        assert detail["status"] == "completed"
+        assert failures["running"] == 0
+        assert detail["attempts"] == 1
 
     async def test_recording_the_outcome_is_retried(
         self, api: ApiHarness, monkeypatch: pytest.MonkeyPatch
@@ -572,7 +577,7 @@ class TestCancel:
 
         assert response.status_code == 200
         assert response.json() == {"run_id": run_id, "status": "cancelled"}
-        assert not api.services.runner.is_active(run_id)
+        assert not api.worker.is_active(run_id)
         detail = (await api.client.get(f"{BASE}/{run_id}")).json()
         assert detail["status"] == "cancelled"
         assert detail["finished_at"]
@@ -611,15 +616,20 @@ class TestCancel:
         assert all(s["started"] == 0 for s in detail["progress"]["steps"])
 
     async def test_cancel_of_a_run_that_completes_meanwhile_is_409(
-        self, api: ApiHarness, monkeypatch: pytest.MonkeyPatch
+        self, make_api: MakeApi, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        run_id = await api.services.recorder.create_run(question="racing", mode="quick")
+        # The run's worker is in another process; it finishes just before the cancel.
+        api = await make_api(run_worker_in_api=False)
+        recorder = api.services.recorder
+        run_id = await recorder.create_run(question="racing", mode="quick")
+        real = recorder.transition
 
-        async def completes_first(key: str, *, wait: float) -> bool:
-            await api.services.recorder.transition(key, "completed")
-            return True
+        async def completes_first(key: str, status: str, **kwargs: Any) -> bool:
+            if status == "cancelled":
+                await real(key, "completed")
+            return await real(key, status, **kwargs)
 
-        monkeypatch.setattr(api.services.runner, "cancel", completes_first)
+        monkeypatch.setattr(recorder, "transition", completes_first)
         response = await api.client.post(f"{BASE}/{run_id}/cancel")
 
         assert response.status_code == 409
@@ -635,8 +645,9 @@ class TestCancel:
         assert response.json()["error"]["code"] == "run_not_active"
         assert response.json()["error"]["details"] == {"status": "completed"}
 
-    async def test_cancel_a_run_with_no_task_in_this_process(self, api: ApiHarness) -> None:
-        run_id = await api.services.recorder.create_run(question="orphan", mode="quick")
+    async def test_cancel_a_run_with_no_task_in_this_process(self, make_api: MakeApi) -> None:
+        api = await make_api(run_worker_in_api=False)
+        run_id = await api.create()
 
         response = await api.client.post(f"{BASE}/{run_id}/cancel")
 
@@ -673,7 +684,7 @@ class TestDelete:
 
         assert (await api.client.delete(f"{BASE}/{run_id}")).status_code == 204
 
-        assert not api.services.runner.is_active(run_id)
+        assert not api.worker.is_active(run_id)
         assert (await api.client.get(f"{BASE}/{run_id}")).status_code == 404
 
     async def test_delete_unknown_run_is_404(self, api: ApiHarness) -> None:
@@ -723,6 +734,17 @@ class TestSecurity:
 
         assert anonymous.status_code == 401
         assert authed.status_code == 503
+
+    async def test_cors_allows_only_the_configured_origins(self, make_api: MakeApi) -> None:
+        api = await make_api(cors_allow_origins="https://app.example, https://admin.example")
+        preflight = {"Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "x-api-key"}
+
+        allowed = await api.client.options(BASE, headers={"Origin": "https://app.example", **preflight})
+        refused = await api.client.options(BASE, headers={"Origin": "https://evil.example", **preflight})
+
+        assert allowed.headers["access-control-allow-origin"] == "https://app.example"
+        assert "access-control-allow-credentials" not in allowed.headers
+        assert "access-control-allow-origin" not in refused.headers
 
     async def test_request_rate_limit(self, make_api: MakeApi) -> None:
         api = await make_api(rate_limit_requests=3)
@@ -815,66 +837,242 @@ class TestErrorEnvelope:
 
 
 # ===========================================================================
-# Lifecycle: startup sweep, shutdown, readiness
+# Lifecycle (M8): workers, leases, resume, readiness
 # ===========================================================================
 
 
+async def run_row(api: ApiHarness, run_id: str) -> ResearchRun:
+    async with api.session_factory() as session:
+        run = await session.get(ResearchRun, uuid.UUID(run_id))
+        assert run is not None
+        return run
+
+
+async def agent_events(api: ApiHarness, run_id: str, agent: str, kind: str) -> list[dict[str, Any]]:
+    async with api.session_factory() as session:
+        rows = await session.execute(
+            select(RunEvent)
+            .where(
+                RunEvent.run_id == uuid.UUID(run_id),
+                RunEvent.agent == agent,
+                RunEvent.type == kind,
+            )
+            .order_by(RunEvent.seq)
+        )
+        return [dict(row.payload or {}) for row in rows.scalars()]
+
+
+async def expire_lease(api: ApiHarness, run_id: str) -> None:
+    from sqlalchemy import update
+
+    async with api.session_factory() as session:
+        await session.execute(
+            update(ResearchRun)
+            .where(ResearchRun.id == uuid.UUID(run_id))
+            .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+        await session.commit()
+
+
+async def kill_worker(api: ApiHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop the API's worker the way a crash would: nothing released, the lease left to lapse."""
+
+    async def no_release(worker_id: str, run_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(api.services.queue, "release", no_release)
+    await api.worker.shutdown(grace=5.0)
+    monkeypatch.undo()
+
+
 class TestLifecycle:
-    async def test_startup_marks_unfinished_runs_failed(self, api: ApiHarness) -> None:
-        recorder = api.services.recorder
-        queued = await recorder.create_run(question="left queued", mode="quick")
-        running = await recorder.create_run(question="left running", mode="quick")
-        await recorder.transition(running, "running")
-        done = await api.create()
-        await api.wait_for(done, "completed")
+    async def test_a_run_survives_its_worker_dying(
+        self, api: ApiHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """M8 acceptance: a killed worker's run is resumed from its checkpoint by another."""
+        api.hold.add("ReportOutput")  # hold the run at the synthesizer
+        await hold(api)
+        run_id = await api.create()
+        await asyncio.wait_for(api.waiting.wait(), 10)
+        researched = len(await agent_events(api, run_id, "web_researcher", "agent_started"))
+        assert researched > 0
 
-        recovered = await api.services.startup()
+        await kill_worker(api, monkeypatch)
+        run = await run_row(api, run_id)
+        assert run.status == "running" and run.worker_id is not None and run.attempts == 1
 
-        assert set(recovered) == {queued, running}
-        for run_id in (queued, running):
-            detail = (await api.client.get(f"{BASE}/{run_id}")).json()
-            assert detail["status"] == "failed"
-            assert detail["error"] == INTERRUPTED_ERROR
-            last = (await stream(api, run_id))[-1]["data"]
-            assert last["payload"] == {"status": "failed", "error": INTERRUPTED_ERROR}
-        assert (await api.client.get(f"{BASE}/{done}")).json()["status"] == "completed"
+        api.gate.set()
+        await expire_lease(api, run_id)
+        other = build_worker_services(
+            api.settings, api.session_factory, runtime_kwargs=api.runtime_kwargs
+        )
+        await other.startup()
+        try:
+            detail = await api.wait_for(run_id)
+        finally:
+            await other.shutdown()
 
-    async def test_lifespan_runs_the_startup_sweep(self, api: ApiHarness) -> None:
-        orphan = await api.services.recorder.create_run(question="orphan", mode="quick")
+        assert detail["status"] == "completed"
+        assert detail["attempts"] == 2
+        assert (await run_row(api, run_id)).worker_id == other.worker.worker_id
+        # Finished steps were not run again: one planner, the same branches.
+        assert len(await agent_events(api, run_id, "planner", "agent_started")) == 1
+        assert len(await agent_events(api, run_id, "web_researcher", "agent_started")) == researched
+        # The cut-short synthesizer was closed, then ran again to the end.
+        finished = await agent_events(api, run_id, "synthesizer", "agent_finished")
+        assert finished[0] == {"status": "interrupted"} and len(finished) == 2
+        steps = {s["agent"]: s["status"] for s in detail["progress"]["steps"]}
+        assert set(steps.values()) == {"completed"}
+        statuses = [e["data"]["payload"] for e in await stream(api, run_id) if e["event"] == "run_status"]
+        assert statuses[-2]["status"] == "running" and statuses[-2]["resumed"] is True
+        assert statuses[-1]["status"] == "completed"
+        assert (await api.client.get(f"{BASE}/{run_id}/report")).status_code == 200
+        # A completed run keeps no checkpoints.
+        assert await api.services.research.checkpoints.aget_tuple(
+            {"configurable": {"thread_id": run_id}}
+        ) is None
 
-        async with api.app.router.lifespan_context(api.app):
-            detail = (await api.client.get(f"{BASE}/{orphan}")).json()
-
-        assert detail["status"] == "failed"
-        assert not api.services.runner.accepting  # shut down on exit
-
-    async def test_sweep_can_be_disabled(self, make_api: MakeApi) -> None:
-        api = await make_api(recover_orphaned_runs=False)
-        orphan = await api.services.recorder.create_run(question="orphan", mode="quick")
-
-        assert await api.services.startup() == []
-        assert (await api.client.get(f"{BASE}/{orphan}")).json()["status"] == "queued"
-
-    async def test_shutdown_interrupts_running_runs(self, api: ApiHarness) -> None:
+    async def test_shutdown_hands_runs_back_for_another_worker(self, api: ApiHarness) -> None:
         await hold(api)
         run_id = await api.create()
         await asyncio.wait_for(api.waiting.wait(), 10)
 
         await api.services.shutdown()
 
+        run = await run_row(api, run_id)
+        assert run.status == "running"
+        assert run.worker_id is None
+        assert run.lease_expires_at is not None
+        assert run.attempts == 0  # a clean handover is not an attempt
+
+        api.gate.set()
+        other = build_worker_services(
+            api.settings, api.session_factory, runtime_kwargs=api.runtime_kwargs
+        )
+        await other.startup()
+        try:
+            assert (await api.wait_for(run_id))["status"] == "completed"
+        finally:
+            await other.shutdown()
+
+    async def test_a_run_that_keeps_killing_its_worker_is_failed(self, make_api: MakeApi) -> None:
+        api = await make_api(run_worker_in_api=False, max_run_attempts=2)
+        run_id = await api.create()
+        queue = api.services.queue
+        for _ in range(2):
+            claim = await queue.claim_next("doomed-worker")
+            assert claim is not None and claim.run_id == run_id
+            await expire_lease(api, run_id)
+
+        assert await queue.claim_next("next-worker") is None
+
         detail = (await api.client.get(f"{BASE}/{run_id}")).json()
         assert detail["status"] == "failed"
-        assert detail["error"] == INTERRUPTED_ERROR
-        refused = await api.client.post(BASE, json={"question": "after shutdown"})
-        assert refused.status_code == 503
+        assert detail["error"] == gave_up_error(2)
+
+    async def test_a_failed_run_can_be_resumed(
+        self, api: ApiHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = research_service.execute_run
+        failures = [RuntimeError("model quota exhausted")]
+
+        async def fails_once(*args: Any, **kwargs: Any) -> Any:
+            if failures:
+                raise failures.pop()
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(research_service, "execute_run", fails_once)
+        run_id = await api.create()
+        assert (await api.wait_for(run_id))["error"] == "RuntimeError: model quota exhausted"
+
+        response = await api.client.post(f"{BASE}/{run_id}/resume")
+
+        assert response.status_code == 202
+        assert response.json()["status"] == "queued"
+        assert response.json()["links"]["resume"] == f"{BASE}/{run_id}/resume"
+        detail = await api.wait_for(run_id)
+        assert detail["status"] == "completed"
+        assert detail["error"] is None and detail["finished_at"]
+        # The stream follows the run past its first end to its last.
+        statuses = [
+            e["data"]["payload"]["status"]
+            for e in await stream(api, run_id)
+            if e["event"] == "run_status"
+        ]
+        assert statuses == ["queued", "running", "failed", "queued", "running", "completed"]
+
+    async def test_only_a_failed_run_can_be_resumed(self, api: ApiHarness) -> None:
+        run_id = await api.create()
+        await api.wait_for(run_id, "completed")
+
+        response = await api.client.post(f"{BASE}/{run_id}/resume")
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "run_not_resumable"
+        assert response.json()["error"]["details"] == {"status": "completed"}
+        assert (await api.client.post(f"{BASE}/{uuid.uuid4()}/resume")).status_code == 404
+
+    async def test_the_lifespan_stops_the_worker(self, make_api: MakeApi) -> None:
+        # The harness already started the services; the lifespan's start is a no-op.
+        api = await make_api()
+
+        async with api.app.router.lifespan_context(api.app):
+            run_id = await api.create()
+            assert (await api.wait_for(run_id))["status"] == "completed"
+
+        queued = await api.services.recorder.create_run(question="after shutdown", mode="quick")
+        await asyncio.sleep(0.3)
+        assert (await api.client.get(f"{BASE}/{queued}")).json()["status"] == "queued"
+
+    async def test_an_api_without_a_worker_only_queues(self, make_api: MakeApi) -> None:
+        api = await make_api(run_worker_in_api=False)
+        run_id = await api.create()
+        await asyncio.sleep(0.3)
+        assert (await api.client.get(f"{BASE}/{run_id}")).json()["status"] == "queued"
+
+        worker = build_worker_services(
+            api.settings, api.session_factory, runtime_kwargs=api.runtime_kwargs
+        )
+        await worker.startup()
+        try:
+            assert (await api.wait_for(run_id))["status"] == "completed"
+        finally:
+            await worker.shutdown()
+
+    async def test_a_worker_that_lost_its_run_stops_working_on_it(self, make_api: MakeApi) -> None:
+        # Renew every 0.1s, so the loss is noticed quickly.
+        api = await make_api(run_lease_seconds=0.3)
+        await hold(api)
+        run_id = await api.create()
+        await asyncio.wait_for(api.waiting.wait(), 10)
+        from sqlalchemy import update
+
+        async with api.session_factory() as session:  # another worker took it over
+            await session.execute(
+                update(ResearchRun)
+                .where(ResearchRun.id == uuid.UUID(run_id))
+                .values(worker_id="another-worker")
+            )
+            await session.commit()
+
+        await api.until(lambda: not api.worker.is_active(run_id), timeout=5)
+        run = await run_row(api, run_id)
+        assert (run.status, run.worker_id) == ("running", "another-worker")
+        # Its checkpoints stay: the new owner resumes from them.
+        assert await api.services.research.checkpoints.aget_tuple(
+            {"configurable": {"thread_id": run_id}}
+        ) is not None
 
     async def test_ready_pings_the_database(self, api: ApiHarness) -> None:
         body = (await api.client.get("/ready")).json()
         assert body["status"] == "ready"
         assert body["checks"]["database"] == "ok"
-        assert body["runs"] == {"running": 0, "pending": 0}
+        assert body["runs"] == {"queued": 0, "running": 0}
+        assert body["worker"]["running"] == 0
+        assert body["worker"]["capacity"] == api.settings.max_concurrent_runs
 
     async def test_ready_reports_a_broken_database(self, api: ApiHarness) -> None:
+        await api.services.shutdown()
         await api.engine.dispose()
         broken = api.services.session_factory
         broken.configure(bind=create_bad_engine())

@@ -1,11 +1,12 @@
 # ResearchMind — Master Implementation Plan
 
 > **Status:** Active implementation
-> **Done:** M0, M1, M2, M4, M5, M6 (offline acceptance; live checks pending: migration 0003 on
-> Supabase, the M5 verification eval, and the M6 contradiction eval and latency targets)
-> **Open:** M3 seed eval, M5 verification eval, M6 contradiction eval and per-mode latency
-> (all need a live `GEMINI_API_KEY` run)
-> **Next:** M7 — evaluation framework
+> **Done:** M0, M1, M2, M4, M5, M6, M7 (offline acceptance), M8 (verified on the local
+> production stack; live checks pending: migrations 0003 and 0004 on Supabase, the M5
+> verification eval, the M6 contradiction eval and latency targets, and the M7 benchmark run)
+> **Open:** M3 seed eval, M5 verification eval, M6 contradiction eval and per-mode latency, M7
+> live benchmark (all need a live `GEMINI_API_KEY` run); an AWS deployment (guide written)
+> **Next:** the live evals and the M7 benchmark; then the frontend
 > **Last updated:** 2026-10-28
 >
 > This is the single source of truth for the roadmap. `ResearchMind_PRD.md` holds
@@ -48,8 +49,10 @@ report in which every citation points to a stored source.
 | ORM / migrations | SQLAlchemy 2.0 async (asyncpg), Alembic | |
 | Web search | DuckDuckGo via `ddgs` (replaced `duckduckgo-search` in M3 — it silently returned no results) | Behind the `SearchProvider` interface (M3); Tavily/Brave/SearXNG as alternatives |
 | Scraping | httpx + BeautifulSoup4 | SSRF-safe, robots-aware |
-| Background jobs | In-process asyncio tasks (`JobRunner`) | Single API worker assumed until M8 |
-| Realtime | SSE from `run_events` (ordered by `seq`) | In-process wake-ups; Postgres LISTEN/NOTIFY in M8 |
+| Background jobs | Postgres as the queue; workers claim runs under a lease (M8) | `RunWorker` + `JobRunner`; a worker can run inside the API |
+| Checkpoints | `SqlCheckpointSaver` on the app's engine (M8) | Runs resume after a worker dies, a clean shutdown, or `POST /resume` |
+| Realtime | SSE from `run_events` (ordered by `seq`) | Postgres LISTEN/NOTIFY across processes (M8); polling fallback |
+| Deployment | Multi-stage Dockerfile, Nginx, compose (M8) | `docs/DEPLOY_AWS.md` for EC2 / ECS |
 | Tracing | LangSmith via env (opt-in) | Run = trace, node = span (M4); LLM-call spans deferred |
 | Quality | pytest, pytest-asyncio, ruff, mypy | |
 
@@ -213,7 +216,9 @@ and its **Done when** criteria met.
 - [x] Killing the server mid-run leaves no run stuck in `running`: graceful shutdown records
   "interrupted"; the startup sweep catches a hard kill (`TestLifecycle`).
 - [x] API tests cover every endpoint, with the mocked LLM.
-- [ ] Live check against Supabase after `alembic upgrade head` (migration 0003).
+- [ ] Live check against Supabase after `alembic upgrade head` (migrations 0003 and 0004). Until
+  M8, 0003's revision ID was too long for Alembic's version table and could not apply anywhere;
+  fixed in M8 and verified on PostgreSQL 16 in the Docker stack.
 
 **As built (2026-10-27)**
 - **Event order:** migration `0003` adds `run_events.seq` (1, 2, 3, ... per run; unique with
@@ -269,8 +274,8 @@ and its **Done when** criteria met.
   with tests (shutdown with open streams, failure paths, unstarted-task cancel, cursor bounds,
   slot release on timeout, cancel-after-completion, auth ordering and throttling, FastAPI floor);
   the `max_sources` race above is documented instead.
-- **Not yet:** `/graph` (M6); resume from checkpoint and multi-worker fan-out (M8); CORS still
-  permissive (M8).
+- **Not yet (all done since):** `/graph` (M6); resume from checkpoint and multi-worker fan-out
+  (M8); CORS still permissive (M8).
 
 ---
 
@@ -428,7 +433,7 @@ and its **Done when** criteria met.
 
 ---
 
-### 📋 M7 — Evaluation framework
+### ✅ M7 — Evaluation framework
 
 - Grow the seed set to 30–50 questions across all modes, with gold sources and expected sub-topics.
 - Compare three systems: baseline LLM (no retrieval), single-agent RAG, and ResearchMind.
@@ -438,11 +443,101 @@ and its **Done when** criteria met.
   - Operations: hallucination rate, latency, tokens, cost.
 - CLI: `python -m researchmind_agents.evals run --suite default` → JSON + markdown comparison table.
 
-**Done when:** ResearchMind beats both baselines on faithfulness and citation precision; results committed under `evals/results/`.
+**Done when**
+- [x] One command produces the comparison table (PRD s11): `run --suite offline` writes
+  `results.md` / `results.json` end to end on the fakes (`test_evals_cli.py`).
+- [x] Benchmark: 40 questions, 10 per mode, each with expected sub-topics and gold sources
+  (`test_evals_benchmark.py`).
+- [x] Judge prompts versioned; a spot-check sample is written with every run, and
+  `agreement` scores human labels against it.
+- [ ] Live: ResearchMind beats both baselines on faithfulness and citation precision; results
+  committed under `evals/results/`.
+- [ ] Spot-check: label `spot_check.jsonl` of the live run and report the judge's agreement.
+
+**As built (2026-10-28)**
+- **Benchmark** (`evals/benchmark.jsonl`, suite `default`): 40 questions, 10 per mode. The 8 seed
+  questions are the first 8 quick ones; decision questions carry a `user_context` and expect "a
+  clear recommendation" among their sub-topics. Gold sources are sites or page prefixes written
+  without a scheme (`energy.gov`, `peps.python.org/pep-0703`, `arxiv.org/abs/2005.11401`); a URL
+  matches when its host is the gold host or a subdomain and its path starts with the gold path,
+  since live search finds different pages day to day. `seed.jsonl` is unchanged (suite `seed`).
+  Both the sub-topics and the gold sources are hand-written: spot-check them before relying on
+  retrieval numbers.
+- **Systems** (`evals/systems.py`), each on a fresh runtime with the same model, tools, and
+  per-run budget, one at a time:
+  - *Closed book* (`baseline_closed_book/v1`): one prompt, no retrieval, asked for the URLs of pages
+    that state each sentence (or none rather than a guess). Every distinct cited URL is fetched
+    with the SSRF-guarded `PageExtractTool` (up to `EVAL_BASELINE_MAX_URLS`). A citation is
+    *resolved* (readable text), *missing* (not a URL, host does not resolve, HTTP 404/410: a
+    made-up reference), or *unreachable* (403, robots.txt, timeout: not counted as made up).
+  - *Single-agent RAG* (`baseline_rag/v1`): one search for the question, the top `EVAL_RAG_PAGES`
+    pages in search order (no model picks them), stored with the researchers' own code
+    (`fetch_candidates`, formerly the private `_fetch`, and `store_pages`), the `EVAL_RAG_TOP_K`
+    passages most similar to the question, one call. No citation retry; an unknown label counts as
+    a made-up citation.
+  - *ResearchMind*: `run_research` in the question's mode on an in-memory store. A citation's
+    evidence is what the synthesizer relied on: the passages behind the sentence's own claims
+    from that source (verified modes), or the source's passages shown to the model (quick).
+- **Judge** (`evals/judge.py`, prompts `eval_support/v1` and `eval_coverage/v2`): not
+  ResearchMind's fact checker, so the system under test does not grade itself; set
+  `EVAL_JUDGE_MODEL` to use a different model too (default: `LLM_MODEL`). Temperature 0. It reads
+  one excerpt per resolved citation (`best_excerpt`, `EVAL_JUDGE_EXCERPT_CHARS`), fenced as
+  untrusted data along with the sentence, and returns a stance per excerpt and a verdict
+  (`supported`, `partial`, `unsupported`, `contradicted`). `reconcile_verdict` makes verdicts agree
+  with stances. Sentences with no readable citation are `unsupported` by rule and never reach
+  it. A failed call leaves its sentences unjudged and out of the metrics, with the error recorded.
+- **Metrics** (`evals/metrics.py`, definitions repeated in every `results.md`): faithfulness
+  (sentences fully supported by their own evidence), citation precision (citations that support
+  their sentence), fabricated citations, hallucination rate (sentences contradicted by their
+  evidence, or resting only on made-up sources), completeness and relevance (coverage judge),
+  P@K / R@K / MRR, task completion, rounds, latency, tokens, cost. Answer metrics are averaged per
+  answer, over completed answers; an extractive fallback is *not completed* (it quotes evidence and
+  would inflate faithfulness). Retrieval ranks each system's stored sources by their best passage's
+  similarity to the question, one ranking for both retrieving systems. The verdict compares means
+  only over questions every system completed. Judge tokens are reported apart from the systems'.
+- **CLI** (`evals/cli.py`; `python -m researchmind_agents.evals`): `run` (`--suite`, `--systems`,
+  `--modes`, `--questions`, `--limit`, `--out`, `--resume`, `--config`), `table` (rebuild from a
+  results directory), `agreement` (score a labelled spot-check file). A run directory holds
+  `meta.json`, `details.jsonl` (appended after every answer, so `--resume` continues an
+  interrupted run; it refuses a different model or judge), `results.json`, `results.md`, and
+  `spot_check.jsonl` (30 judged citations round-robin across systems, in a fixed hashed order;
+  never overwritten once labelled).
+- **Config across the boundary:** the CLI lives in the agents package, which may not import the
+  backend. The backend declares `app.services.agent_runtime:build_agent_config` as an entry point
+  in the `researchmind_agents.config` group, and `--config auto` loads it (`--config
+  module:function` names any other provider). An existing install needs `pip install -e backend`
+  once to register it. New settings: `EVAL_JUDGE_MODEL`, `EVAL_RETRIEVAL_K`, `EVAL_RAG_PAGES`,
+  `EVAL_RAG_TOP_K`, `EVAL_JUDGE_BATCH_SIZE`, `EVAL_JUDGE_EXCERPT_CHARS`, `EVAL_MAX_STATEMENTS`,
+  `EVAL_BASELINE_MAX_URLS`, `EVAL_SPOT_CHECK_SAMPLE`, `EVAL_MAX_OUTPUT_TOKENS` (`EvalConfig`).
+- **Offline suite** (`evals/offline.py`): four questions, one per mode, on a twelve-page
+  synthetic corpus (`.example` hosts) with every model call scripted, including the judge. It
+  runs the whole harness in about a second with no network or keys; its numbers check the harness
+  and measure nothing about the systems.
+- **Results in git:** `.gitignore` now keeps `evals/results/benchmark-*/` (minus `details.jsonl`)
+  so live summaries can be committed; seed, offline, and other raw output stay ignored.
+- **Live smoke test (2026-10-28)**, `bm-q03` (quick) on Gemini 3.1 Flash Lite, all three systems:
+  every path worked against the real APIs, about 2.8 minutes in all. Closed book 9 sentences,
+  faithfulness 11%, citation precision 29% (its one cited URL, pgvector's GitHub page, resolved;
+  most sentences say more than that page does); RAG 7 sentences and ResearchMind 13, both 100% / 100%;
+  completeness 100% for all three. Calls: closed book 1, RAG 1, ResearchMind 6, judge 10 (so a
+  full run is over a thousand calls and several hours on the free tier). Two findings:
+  - The v1 coverage prompt judged "off-topic" against the topic list, not the question, and
+    flagged on-topic sentences (an aspect the list does not name, a recommendation): relevance
+    came out at 38-56%. `eval_coverage/v2` makes the two judgements separate; on the same
+    answers it flags none, and still flags two unrelated sentences padded in as a control.
+  - Both retrieving systems scored 0 on P@K / R@K / MRR: live search returned only blog posts,
+    none of the gold sources (pgvector's GitHub, Supabase docs, the HNSW paper). On the live web
+    the retrieval metrics mostly measure how often search reaches authoritative sources.
+  - RAG tied ResearchMind at 100% on this quick-mode question, and a tie does not "beat". Quick
+    mode does not verify claims, so the verified modes are where a difference should show.
+- **Known limits:** one run per question (no variance estimate); the default judge is the research
+  model, which may favour its own phrasing; closed-book URLs behind robots.txt or bot walls count
+  as unreachable, so the baseline's faithfulness is a lower bound; gold sources are lenient and
+  hand-labelled; latency includes free-tier rate-limit waits.
 
 ---
 
-### 📋 M8 — Hardening & deployment
+### ✅ M8 — Hardening & deployment
 
 - Resume failed or aborted runs from the Postgres checkpointer.
 - Multi-worker support: SSE fan-out via Postgres `LISTEN/NOTIFY`.
@@ -450,7 +545,90 @@ and its **Done when** criteria met.
 - Multi-stage production `Dockerfile`; Nginx config; AWS EC2/ECS guide with managed Postgres.
 - README: architecture diagram, curl examples, local setup.
 
-**Done when:** the deployed instance passes a smoke test of the full API; a run survives a worker restart.
+**Done when** (PRD: "fresh-clone setup works from README alone; a killed worker resumes a run from
+checkpoint")
+- [x] The deployed instance passes a smoke test of the full API: `backend/scripts/smoke_test.py api`
+  against the production stack (Nginx → 2 uvicorn processes, 2 workers, PostgreSQL 16 + pgvector),
+  with a real quick-mode run on Gemini: auth, error envelopes, a run streamed live through Nginx
+  from a worker in another container, every read endpoint, cancel, resume, delete. All checks pass.
+- [x] A run survives a worker restart: `smoke_test.py restart` sends SIGKILL to every worker during
+  research and starts new ones; a new worker resumes the run (attempt 2) when the lease lapses.
+  The planner ran once, the four research branches cut short were closed as `interrupted` and
+  re-ran, no source was stored twice, and the report was written. Also in the test suite
+  (`test_api_research.py::TestLifecycle::test_a_run_survives_its_worker_dying`, SQLite).
+- [x] Fresh clone: a copy of the tree without `.git`, `.venv`, or any `.env`, set up by the
+  README's Docker steps alone (`cp .env.example backend/.env`, two keys, one compose command),
+  passed both smoke tests above.
+- [ ] A deployment on AWS (the guide is written; running it needs an AWS account).
+
+**As built (2026-10-28)**
+- **Run queue in `research_runs`** (migration `0004`: `worker_id`, `lease_expires_at`,
+  `attempts`). The API only inserts `queued` runs. `RunQueue.claim_next` hands a worker, first,
+  runs whose lease lapsed (resumed; failed instead at `MAX_RUN_ATTEMPTS`), then the oldest queued
+  run. A claim is one conditional `UPDATE` plus its `run_status` event, so racing workers never
+  share a run, on PostgreSQL or SQLite, without row locks. Leases are renewed every
+  `RUN_LEASE_SECONDS / 3`; a renewal reports runs the worker lost (cancelled, deleted, taken over)
+  and the worker stops them. A clean shutdown releases its runs (claimable at once, not counted
+  as an attempt); a crash leaves the lease to lapse. Finishing a run names its owner, so a worker
+  that lost its lease cannot settle a run another resumed.
+- **Workers** (`app/workers/research_worker.py`): `python -m app.workers.research_worker`, or one
+  inside the API (`RUN_WORKER_IN_API=true`, the default, so one container still works). The M4
+  `JobRunner` is reused per worker; the API process holds no run state. The startup sweep and
+  `RECOVER_ORPHANED_RUNS` are gone: lapsed leases replace them.
+- **Checkpoints** (`app/services/checkpointer.py`, three tables): LangGraph's `InMemorySaver`
+  ported to SQLAlchemy on the app's engine, so no new driver or pool, Alembic-managed, tested on
+  SQLite, and it works through Supabase's transaction pooler. `run_research` resumes from an
+  existing checkpoint (a finished graph returns its final state) and writes each step's
+  checkpoint before the next starts (`durability="sync"`). Completed and cancelled runs drop
+  their checkpoints; failed runs keep them for `POST /{id}/resume`.
+- **Re-running an interrupted step** must not duplicate or crash: sub-question and contradiction
+  IDs are derived from the run, round, and position or claims (`state.stable_id`); the SQL store
+  upserts sub-questions, claims (links replaced), and contradictions; a second report becomes the
+  next version; a research branch that finds its own earlier sources stored reuses their passages
+  (`ResearchStore.list_passages`) instead of treating them as duplicates. A resumed run's budget
+  starts from what earlier attempts spent (`BudgetTracker.seed` from `llm_usage`), and its source
+  cap from the sources stored. Steps cut short get an `agent_finished` with
+  `"status": "interrupted"`, so progress counts stay balanced.
+- **Across processes:** every event and status change sends `NOTIFY` in its transaction
+  (`rm_run_events`, `rm_run_status`); `PgListener` (one asyncpg connection per process, reconnects
+  with back-off and wakes every stream after a gap) feeds the in-process notifier. Streams, claims,
+  and cancels react at once; polling remains the fallback. Supabase's transaction pooler cannot
+  `LISTEN`, so `DATABASE_LISTEN_URL` points at the session pooler (or processes poll). The event
+  stream follows a failed run that is resumed past its first terminal event.
+- **API:** `POST /{id}/resume` (failed runs; 409 otherwise); cancel and delete work from any
+  process (status change, then notification); `MAX_PENDING_RUNS` is counted in the database;
+  `RunDetail.attempts`; `/ready` reports queued/running counts, the in-process worker, and whether
+  notifications arrive. CORS from `CORS_ALLOW_ORIGINS`, never with credentials (clients use
+  `X-API-Key`).
+- **SSRF pinning:** `PinnedNetworkBackend` (an httpcore network backend) resolves the host,
+  refuses it if any address is blocked, and connects to an address it just vetted; TLS still
+  verifies the hostname. Environment proxies are ignored (they would resolve the host again).
+  httpx has no public hook for the backend, so the transport's pool is replaced; a test guards it.
+- **Logs:** `run_id` and `worker_id` are bound with context variables, so every line inside a
+  run carries them, including the agents package's and LangGraph's branches.
+- **Deployment:** multi-stage `backend/Dockerfile` (wheels → non-root runtime; a `dev` target for
+  `docker-compose.yml`); one image runs the API, the worker, and migrations.
+  `docker-compose.prod.yml` (migrate → API with `WEB_CONCURRENCY` processes + worker replicas →
+  Nginx with SSE pass-through) and `docker-compose.localdb.yml` (a bundled pgvector PostgreSQL).
+  `docs/DEPLOY_AWS.md`: RDS or Supabase, Secrets Manager, EC2 + Compose, ECS Fargate task
+  definitions and services, ALB settings, CloudWatch queries. `backend/scripts/smoke_test.py`.
+- **Bugs the production build found:** `pgvector` was imported but never declared in
+  `backend/pyproject.toml` (a fresh install could not import the models); and revision
+  `0003_run_event_seq_and_run_options` (34 characters) did not fit Alembic's `VARCHAR(32)` version
+  column, so `alembic upgrade head` failed on every real PostgreSQL, Supabase included. It is now
+  `0003_run_event_seq_and_options`; PostgreSQL rolled the failed upgrade back, so no database
+  recorded the old ID. A test checks every revision ID's length. `httpcore` is now declared too
+  (imported directly for pinning).
+- **Tests:** 1383 passing (2 failures predate M8: see M6). New: `test_checkpointer.py`,
+  `test_run_queue.py`, `test_pg_listener.py`, `test_logging.py`; resume, shutdown hand-back,
+  attempt cap, lost lease, resume endpoint, and CORS in `test_api_research.py`; idempotent store
+  writes; stable IDs; branch reuse; pinned connections.
+- **Known limits:** lease times come from each host's clock (keep NTP on; the 60 s lease absorbs
+  small skew). Rate limits are per API process. A step re-run after a resume repeats its model
+  calls (the checkpoint is per step), and a branch's sources stored without passages before the
+  crash are skipped as duplicates. `MAX_PENDING_RUNS` can be passed by a run or two under
+  concurrent creates. Events emitted by a step that was cut short stay in the log (the stream
+  shows the step running twice).
 
 ---
 

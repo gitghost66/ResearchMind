@@ -3,8 +3,10 @@ A run's events as a live stream, for the SSE endpoint.
 
 :func:`stream_run_events` replays the events after a cursor, then yields new
 ones as they are written, and ends after the run's terminal ``run_status``
-event. Reading always goes to the database by ``seq``, so replay, live
-delivery, and reconnects (``Last-Event-ID``) are one code path:
+event — unless the run went on after it (a failed run resumed through the API),
+in which case the stream follows the resumed run to its next end. Reading
+always goes to the database by ``seq``, so replay, live delivery, and
+reconnects (``Last-Event-ID``) are one code path:
 
 1. register with the notifier *before* reading, so an event committed between
    the read and the wait still wakes the stream;
@@ -74,6 +76,9 @@ async def stream_run_events(
     # Set when the run looked finished but no terminal event was read yet:
     # look once more (the event commits with the status) before giving up.
     settling = False
+    # The last event yielded was a terminal status. The stream ends unless a
+    # later event shows the run was resumed.
+    ended = False
 
     with notifier.listen(key) as wakeup:
         while True:
@@ -86,8 +91,7 @@ async def stream_run_events(
             for event in events:
                 cursor = event["seq"]
                 yield event
-                if is_terminal_event(event):
-                    return
+                ended = is_terminal_event(event)
             if events:
                 settling = False
                 continue  # a full batch may have more behind it
@@ -96,6 +100,8 @@ async def stream_run_events(
                 return  # the run was deleted
             status, error = run_row
             if status in TERMINAL_STATUSES:
+                if ended:
+                    return
                 if settling:
                     yield {
                         "seq": cursor,

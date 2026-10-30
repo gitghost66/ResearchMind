@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
     database_url: str = ""
+    # Connection for LISTEN/NOTIFY (live events and run signals across
+    # processes). Empty uses DATABASE_URL. Supabase's transaction pooler
+    # (port 6543) cannot LISTEN: point this at the session pooler (port 5432)
+    # or the direct connection, or processes fall back to polling.
+    database_listen_url: str = ""
 
     # --- Gemini ---
     gemini_api_key: str = ""
@@ -72,6 +77,9 @@ class Settings(BaseSettings):
     # Clients send it as X-API-Key. Empty disables auth (local development only).
     api_key: str = ""
     debug: bool = False
+    # Browser origins allowed to call the API (comma-separated, or "*").
+    # Requests carry X-API-Key, not cookies, so credentials are never allowed.
+    cors_allow_origins: str = "*"
 
     # --- API limits ---
     max_question_chars: int = 2000
@@ -88,17 +96,28 @@ class Settings(BaseSettings):
     rate_limit_runs: int = 10
 
     # --- Background runs ---
-    # Runs executing at once; further runs wait in the queue.
+    # Runs are queued in the database and executed by workers
+    # (python -m app.workers.research_worker), each claiming runs under a lease.
+    # Runs one worker executes at once; further runs wait in the queue.
     max_concurrent_runs: int = 2
-    # Queued plus running; beyond this, new runs get 503.
+    # Queued plus running, across all workers; beyond this, new runs get 503.
     max_pending_runs: int = 20
-    # How long cancel/delete wait for a run to stop before answering.
+    # Also run a worker inside the API process (one container is enough).
+    # Turn off when separate worker processes run.
+    run_worker_in_api: bool = True
+    # A worker renews its runs' lease every third of this. A run whose lease
+    # lapses (its worker died) is resumed from its last checkpoint by any worker.
+    run_lease_seconds: float = 60.0
+    # How often an idle worker looks for queued runs without being notified.
+    worker_poll_seconds: float = 5.0
+    # Times a worker may start a run before an interrupted run is failed
+    # instead of resumed (it may be what kills its worker).
+    max_run_attempts: int = 3
+    # How long cancel/delete wait for a run in this process to stop.
     cancel_wait_seconds: float = 10.0
-    # On shutdown, running runs are interrupted and given this long to record it.
+    # On shutdown, a worker interrupts its runs and hands them back (released
+    # for another worker to resume), waiting this long for them to stop.
     shutdown_grace_seconds: float = 10.0
-    # On startup, runs left queued/running by a previous process are marked
-    # failed. Assumes one API process; disable when running several.
-    recover_orphaned_runs: bool = True
 
     # --- Event stream (SSE) ---
     # Events are pushed as they are written; this is the fallback poll for
@@ -228,6 +247,22 @@ class Settings(BaseSettings):
     # in scope), comma-separated; other contradictions lower the confidence.
     confidence_resolved_causes: str = "conditions,date,version,dataset,definition"
 
+    # --- Evaluation (M7; python -m researchmind_agents.evals) ---
+    # LLM-as-judge model; empty uses llm_model.
+    eval_judge_model: str = ""
+    # Precision@K / Recall@K cut-offs, comma-separated.
+    eval_retrieval_k: str = "5,10"
+    # Single-agent RAG baseline: pages read for its one query, passages retrieved.
+    eval_rag_pages: int = 6
+    eval_rag_top_k: int = 12
+    eval_judge_batch_size: int = 6
+    eval_judge_excerpt_chars: int = 700
+    eval_max_statements: int = 40
+    # Closed-book baseline: distinct cited URLs fetched per answer.
+    eval_baseline_max_urls: int = 20
+    eval_spot_check_sample: int = 30
+    eval_max_output_tokens: int = 4096
+
     # --- Cost control ---
     # 0 disables a limit.
     max_tokens_per_run: int = 100_000
@@ -279,7 +314,7 @@ class Settings(BaseSettings):
         "case_sensitive": False,
     }
 
-    @field_validator("database_url")
+    @field_validator("database_url", "database_listen_url")
     @classmethod
     def _use_async_driver(cls, value: str) -> str:
         """
@@ -292,6 +327,10 @@ class Settings(BaseSettings):
             if url.startswith(prefix):
                 return "postgresql+asyncpg://" + url[len(prefix) :]
         return url
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.cors_allow_origins.split(",") if origin.strip()]
 
     def agent_config_mapping(self) -> dict[str, Any]:
         """

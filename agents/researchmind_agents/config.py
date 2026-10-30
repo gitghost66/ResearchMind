@@ -267,6 +267,49 @@ class SufficiencyConfig:
         return float(dict(self.loop_deadlines).get(mode, 0.0))
 
 
+@dataclass(frozen=True)
+class EvalConfig:
+    """
+    Evaluation harness (M7): the baselines, the judge, and the metrics.
+
+    Used only by ``researchmind_agents.evals``; a research run never reads it.
+    """
+
+    # Model the LLM-as-judge uses; empty means the research model (llm.model).
+    judge_model: str = ""
+    # Cut-offs for Precision@K and Recall@K.
+    retrieval_k: tuple[int, ...] = (5, 10)
+    # Single-agent RAG baseline: pages read for its one query, and passages
+    # retrieved for its answer.
+    rag_pages: int = 6
+    rag_top_k: int = 12
+    # Answer sentences per judge call, and the excerpt of each cited source
+    # the judge reads (the part most relevant to the sentence).
+    judge_batch_size: int = 6
+    judge_excerpt_chars: int = 700
+    # Sentences judged per answer; later ones are not scored.
+    max_statements: int = 40
+    # Closed-book baseline: distinct cited URLs fetched per answer to check
+    # they exist and say what is claimed.
+    baseline_max_urls: int = 20
+    # Judged citations sampled for a manual spot-check of the judge.
+    spot_check_sample: int = 30
+    # Output cap for the baselines' answers and the judge's replies.
+    max_output_tokens: int = 4096
+
+    def __post_init__(self) -> None:
+        if not self.retrieval_k or any(k <= 0 for k in self.retrieval_k):
+            raise ValueError(f"retrieval_k needs positive cut-offs, got {self.retrieval_k}")
+
+
+def _cutoffs(value: Any, default: tuple[int, ...]) -> tuple[int, ...]:
+    """``"5,10"`` or ``[10, 5]`` -> ``(5, 10)``; *default* when absent."""
+    if value is None:
+        return default
+    parts = value.split(",") if isinstance(value, str) else list(value)
+    return tuple(sorted({int(str(part).strip()) for part in parts if str(part).strip()}))
+
+
 # Why two claims disagree (contradiction records' likely_cause). Mirrored by
 # ``state.ContradictionCause``.
 CONTRADICTION_CAUSES: tuple[str, ...] = (
@@ -414,6 +457,7 @@ class AgentConfig:
     contradictions: ContradictionConfig = field(default_factory=ContradictionConfig)
     sufficiency: SufficiencyConfig = field(default_factory=SufficiencyConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
 
     concurrency_cap: int = 4
     # Per-node safety net, not a latency target: on free tiers a node may wait
@@ -680,6 +724,19 @@ class AgentConfig:
             ),
         )
 
+        evaluation = EvalConfig(
+            judge_model=pick("eval_judge_model", EvalConfig.judge_model),
+            retrieval_k=_cutoffs(values.get("eval_retrieval_k"), EvalConfig.retrieval_k),
+            rag_pages=pick("eval_rag_pages", EvalConfig.rag_pages),
+            rag_top_k=pick("eval_rag_top_k", EvalConfig.rag_top_k),
+            judge_batch_size=pick("eval_judge_batch_size", EvalConfig.judge_batch_size),
+            judge_excerpt_chars=pick("eval_judge_excerpt_chars", EvalConfig.judge_excerpt_chars),
+            max_statements=pick("eval_max_statements", EvalConfig.max_statements),
+            baseline_max_urls=pick("eval_baseline_max_urls", EvalConfig.baseline_max_urls),
+            spot_check_sample=pick("eval_spot_check_sample", EvalConfig.spot_check_sample),
+            max_output_tokens=pick("eval_max_output_tokens", EvalConfig.max_output_tokens),
+        )
+
         return cls(
             llm=llm,
             embedding=embedding,
@@ -694,6 +751,7 @@ class AgentConfig:
             contradictions=contradictions,
             sufficiency=sufficiency,
             scoring=scoring,
+            eval=evaluation,
             concurrency_cap=pick("concurrency_cap", cls.concurrency_cap),
             agent_timeout=pick("agent_timeout", cls.agent_timeout),
             max_iterations=pick("max_iterations", cls.max_iterations),

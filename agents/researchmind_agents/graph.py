@@ -35,6 +35,7 @@ variables, a run is one trace and each node is a span under it.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -68,6 +69,8 @@ from researchmind_agents.nodes.web_researcher import (
 )
 from researchmind_agents.runtime import AgentRuntime
 from researchmind_agents.state import ResearchState, WebResearchTask, new_research_state
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "PLANNER",
@@ -245,13 +248,35 @@ async def run_research(
 
     ``state["report"]`` holds the report JSON and ``state["report_markdown"]``
     its markdown; both are also stored through ``runtime.store``.
+
+    The run's checkpoints are kept under its ``run_id``. If *checkpointer*
+    already holds some, the run resumes from the latest: steps that finished
+    are not run again, and in a fan-out step only the branches that had not
+    finished re-run. A run whose graph had already ended returns that final
+    state without running anything.
+
+    Each step's checkpoint is written before the next step starts
+    (``durability="sync"``), so an interruption loses at most the step in
+    progress.
     """
     mode_profile(mode)  # raises ValueError for an unknown mode
     cleaned = " ".join(question.split())
     if not cleaned:
         raise ValueError("question must not be empty")
 
-    graph = build_research_graph(runtime, checkpointer=checkpointer, mode=mode)
+    saver: BaseCheckpointSaver[Any] = checkpointer if checkpointer is not None else InMemorySaver()
+    graph = build_research_graph(runtime, checkpointer=saver, mode=mode)
+    config = build_run_config(runtime, run_id=run_id, mode=mode)
+
+    if await saver.aget_tuple(config) is not None:
+        snapshot = await graph.aget_state(config)
+        if not snapshot.next:
+            logger.info("Run %s had already finished; nothing to resume", run_id)
+            return cast(ResearchState, dict(snapshot.values))
+        logger.info("Resuming run %s at %s", run_id, ", ".join(snapshot.next))
+        result = await graph.ainvoke(None, config=config, durability="sync")
+        return cast(ResearchState, result)
+
     initial = new_research_state(
         run_id=run_id,
         question=cleaned,
@@ -259,7 +284,7 @@ async def run_research(
         user_context=user_context,
         max_iterations=max_iterations_for(runtime, mode),
     )
-    result = await graph.ainvoke(initial, config=build_run_config(runtime, run_id=run_id, mode=mode))
+    result = await graph.ainvoke(initial, config=config, durability="sync")
     return cast(ResearchState, result)
 
 

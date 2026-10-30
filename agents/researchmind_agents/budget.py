@@ -68,6 +68,15 @@ class BudgetTracker:
         agent["tokens_out"] += usage.completion_tokens
         agent["cost_usd"] = round(agent["cost_usd"] + usage.cost_usd, 10)
 
+    def seed(self, *, tokens: int, cost_usd: float, calls: int) -> None:
+        """
+        Count usage spent before this runtime took the run over: a resumed
+        run's budget covers every attempt, not just the latest.
+        """
+        self.tokens_used += max(0, tokens)
+        self.cost_usd = round(self.cost_usd + max(0.0, cost_usd), 10)
+        self.calls += max(0, calls)
+
     def wrap(self, sink: UsageSink | None = None) -> UsageSink:
         """
         Return a sink that records usage here, then forwards it to *sink*.

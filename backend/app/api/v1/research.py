@@ -103,9 +103,11 @@ async def get_research(run_id: uuid.UUID, services: ServicesDep) -> RunDetail:
     summary="Stream the run's events (Server-Sent Events)",
     description=(
         "Replays the run's events, then streams new ones live, and closes after the "
-        "terminal `run_status` event. Each event's `event` is its type, its `id` is its "
-        "`seq`, and its `data` is a `RunEventOut` object. Reconnect with `Last-Event-ID` "
-        "(or `?after=`) to receive only what was missed."
+        "terminal `run_status` event (a failed run that was resumed streams on to its "
+        "next end). Each event's `event` is its type, its `id` is its `seq`, and its "
+        "`data` is a `RunEventOut` object. Reconnect with `Last-Event-ID` (or `?after=`) "
+        "to receive only what was missed. Events reach the stream from whichever process "
+        "wrote them."
     ),
 )
 async def stream_events(
@@ -187,6 +189,19 @@ async def cancel_research(
     if result.status in ("queued", "running"):
         response.status_code = status.HTTP_202_ACCEPTED
     return result
+
+
+@router.post(
+    "/{run_id}/resume",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Resume a failed run from its last checkpoint",
+    responses={
+        409: {"model": ErrorEnvelope, "description": "The run is not failed."},
+    },
+    dependencies=[Depends(limit_run_creation)],
+)
+async def resume_research(run_id: uuid.UUID, services: ServicesDep) -> RunCreated:
+    return await services.research.resume(run_id)
 
 
 @router.delete(

@@ -1,9 +1,10 @@
 """
-In-process background jobs: one asyncio task per run.
+A process's run tasks: one asyncio task per run.
 
-Research runs execute off the request path (PRD s5) as tasks on the API's own
-event loop — Redis/ARQ were dropped from the stack. :class:`JobRunner` keeps
-the registry of those tasks and enforces two caps:
+Research runs execute off the request path (PRD s5). Since M8 they are queued
+in the database and claimed by :class:`~app.workers.research_worker.RunWorker`,
+which hands each claimed run to a :class:`JobRunner`. The runner keeps the
+registry of those tasks and enforces two caps:
 
 * ``max_concurrent`` runs execute at once; the rest wait their turn (queued);
 * ``max_pending`` runs may be queued or running in total; beyond that,
@@ -15,8 +16,8 @@ callback receives so it can record the right outcome:
 * :data:`CANCEL` — a client asked (``POST /cancel``, ``DELETE``);
 * :data:`SHUTDOWN` — the server is stopping.
 
-The registry is per process. With several API workers each would run its own
-jobs and could not cancel another's; until M8 the API runs as one worker.
+The registry is per process; across processes, runs are coordinated through
+the database (leases, status notifications), not through this class.
 """
 
 from __future__ import annotations

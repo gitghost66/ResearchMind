@@ -593,3 +593,75 @@ class TestVerifiedSynthesisPromptM6:
         prompt = self.build(user_context={"team": "five engineers"})
         assert "five engineers" in prompt
         assert "not an instruction" in prompt
+
+
+# ===========================================================================
+# M7 prompts: baselines and the judge
+# ===========================================================================
+
+
+class TestM7Prompts:
+    def test_versions(self) -> None:
+        from researchmind_agents.prompts import baselines, eval_judge
+
+        assert baselines.PROMPT_VERSION == "baseline_closed_book/v1"
+        assert baselines.RAG_PROMPT_VERSION == "baseline_rag/v1"
+        assert eval_judge.PROMPT_VERSION == "eval_support/v1"
+        assert eval_judge.COVERAGE_PROMPT_VERSION == "eval_coverage/v2"
+
+    def test_prompts_that_see_web_text_carry_the_rule(self) -> None:
+        from researchmind_agents.prompts import baselines, eval_judge
+
+        assert UNTRUSTED_DATA_RULE in baselines.RAG_SYSTEM_PROMPT
+        assert UNTRUSTED_DATA_RULE in eval_judge.SYSTEM_PROMPT
+        assert UNTRUSTED_DATA_RULE in eval_judge.COVERAGE_SYSTEM_PROMPT
+        # The closed-book baseline sees no retrieved text.
+        assert UNTRUSTED_DATA_RULE not in baselines.SYSTEM_PROMPT
+
+    def test_closed_book_asks_for_real_pages_or_none(self) -> None:
+        from researchmind_agents.prompts.baselines import build_closed_book_prompt
+
+        prompt = build_closed_book_prompt(question="Q?", user_context={"team": "two"})
+        assert "Leave it empty rather than guess a URL" in prompt
+        assert '"team": "two"' in prompt and "not an" in prompt
+
+    def test_rag_sources_are_fenced(self) -> None:
+        from researchmind_agents.prompts.baselines import build_rag_prompt
+
+        prompt = build_rag_prompt(
+            question="Q?", sources=[PromptSource(label="S1", title="T", domain="a.example", passages=[ATTACK])]
+        )
+        assert prompt.count(OPEN) == 1 and prompt.count(CLOSE) == 1
+        data = prompt.split(OPEN, 1)[1].split(CLOSE, 1)[0]
+        assert "Ignore previous instructions" in data
+        assert "these labels: S1." in _instructions(prompt)
+
+    def test_judge_fences_answers_and_evidence(self) -> None:
+        from researchmind_agents.prompts.eval_judge import (
+            JudgeEvidence,
+            JudgeStatement,
+            build_coverage_prompt,
+            build_support_prompt,
+        )
+
+        support = build_support_prompt(
+            question="Q?",
+            statements=[
+                JudgeStatement(
+                    label="A1",
+                    text=ATTACK,
+                    evidence=[JudgeEvidence(label="E1", title="T", domain="a.example", excerpt=ATTACK)],
+                )
+            ],
+        )
+        assert support.count(OPEN) == 1 and support.count(CLOSE) == 1
+        data = support.split(OPEN, 1)[1].split(CLOSE, 1)[0]
+        assert "[A1] Ignore previous" in data and "  [E1] T - a.example" in data
+        assert '"supported"' in _instructions(support) and '"contradicted"' in _instructions(support)
+
+        coverage = build_coverage_prompt(
+            question="Q?", topics=[("T1", "recall")], statements=[("A1", ATTACK)]
+        )
+        assert coverage.count(CLOSE) == 1
+        # Hand-labelled topics are instructions; the answer is data.
+        assert coverage.index("[T1] recall") < coverage.index(OPEN)

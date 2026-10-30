@@ -35,7 +35,6 @@ from __future__ import annotations
 import asyncio
 import math
 import re
-import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -57,6 +56,7 @@ from researchmind_agents.state import (
     ContradictionItem,
     ContradictionOutput,
     ResearchState,
+    stable_id,
 )
 from researchmind_agents.tools.excerpts import best_excerpt
 from researchmind_agents.tools.urls import domain_of
@@ -425,7 +425,8 @@ async def _judge(
         explanation = " ".join(detected.explanation.split())[:_MAX_EXPLANATION_CHARS]
         found.append(
             ContradictionItem(
-                id=str(uuid.uuid4()),
+                # Keyed by its claims, so a re-run after a resume replaces it.
+                id=stable_id(run_id, "contradiction", *sorted(ids)),
                 claim_ids=sorted(ids, key=lambda cid: int(label_of[cid][1:])),
                 explanation=explanation,
                 likely_cause=detected.likely_cause,

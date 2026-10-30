@@ -92,6 +92,7 @@ class RunLinks(BaseModel):
     sources: str
     usage: str
     cancel: str
+    resume: str
 
     @classmethod
     def for_run(cls, run_id: str) -> RunLinks:
@@ -104,6 +105,7 @@ class RunLinks(BaseModel):
             sources=f"{base}/sources",
             usage=f"{base}/usage",
             cancel=f"{base}/cancel",
+            resume=f"{base}/resume",
         )
 
 
@@ -165,6 +167,9 @@ class RunDetail(RunSummary):
     options: dict[str, Any]
     plan: dict[str, Any]
     iteration: int
+    # Times a worker started the run since it was queued: above 1 means it
+    # was interrupted and resumed from a checkpoint.
+    attempts: int = 0
     sub_questions: list[SubQuestionOut]
     progress: RunProgress
     report_available: bool

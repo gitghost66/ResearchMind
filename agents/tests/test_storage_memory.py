@@ -122,6 +122,23 @@ class TestPassages:
                 run_id="r", passages=[passage("p1", "s1")], embeddings=[], embedding_model="m"
             )
 
+    async def test_list_passages_of_one_source_for_one_sub_question(self) -> None:
+        store = InMemoryResearchStore()
+        await store.save_source(run_id="r", source=source("s1", "https://a"))
+        later = PassageItem(id="p2", source_id="s1", sub_question_id="sq1", text="b", chunk_index=1)
+        earlier = PassageItem(id="p1", source_id="s1", sub_question_id="sq1", text="a", chunk_index=0)
+        await store.save_passages(
+            run_id="r",
+            passages=[later, earlier, passage("p3", "s1", sq="sq2")],
+            embeddings=[None, None, None],
+            embedding_model="m",
+        )
+
+        found = await store.list_passages(run_id="r", source_id="s1", sub_question_id="sq1")
+
+        assert found == [earlier, later]
+        assert await store.list_passages(run_id="other", source_id="s1", sub_question_id="sq1") == []
+
     async def test_unknown_source_raises(self) -> None:
         store = InMemoryResearchStore()
         with pytest.raises(ValueError, match="unknown source_id"):
@@ -317,6 +334,15 @@ class TestReportsEventsIds:
         first = await store.save_report(run_id="r", report=report, markdown="")
         second = await store.save_report(run_id="r", report=report, markdown="")
         assert first != second
+
+    async def test_a_second_report_for_a_run_is_the_next_version(self) -> None:
+        store = InMemoryResearchStore()
+        report = ResearchReport(title="T", question="Q", mode="quick")
+        first = await store.save_report(run_id="r", report=report, markdown="")
+        other = await store.save_report(run_id="other", report=report, markdown="")
+        second = await store.save_report(run_id="r", report=report, markdown="")
+        versions = [store.reports[i]["version"] for i in (first, other, second)]
+        assert versions == [1, 1, 2]
 
     async def test_log_event(self) -> None:
         store = InMemoryResearchStore()

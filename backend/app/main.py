@@ -7,22 +7,26 @@ reads ``.env``.
 
 The lifespan, when ``DATABASE_URL`` is set:
 
-1. builds the shared services (event recorder, job runner, rate limiters);
-2. marks runs a previous process left unfinished as failed;
-3. on shutdown, interrupts running runs (recorded as failed: interrupted) and
-   waits ``SHUTDOWN_GRACE_SECONDS`` for them to record it.
+1. builds the shared services (event recorder, run queue, rate limiters, and
+   with ``RUN_WORKER_IN_API`` a research worker);
+2. starts listening for PostgreSQL notifications and starts the worker, which
+   resumes runs whose worker died and claims queued ones;
+3. on shutdown, the worker interrupts its runs and releases them for another
+   worker to resume, waiting up to ``SHUTDOWN_GRACE_SECONDS``.
 
-Background runs live in this process, so serve it with one worker.
+Runs live in the database, not in this process: any number of API processes
+(``uvicorn --workers N``) and worker processes can share it.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.v1.router import router as v1_router
 from app.container import AppServices, build_services
@@ -36,6 +40,34 @@ from app.db.session import get_engine, get_session_factory
 logger = logging.getLogger(__name__)
 
 __all__ = ["app", "create_app"]
+
+
+class _SettingsCORS:
+    """
+    CORS from ``CORS_ALLOW_ORIGINS``, read when the first request arrives, so
+    building the app never reads settings. Requests authenticate with the
+    ``X-API-Key`` header, never cookies, so credentials are not allowed.
+    """
+
+    def __init__(self, app: ASGIApp, *, origins: Callable[[], list[str]]) -> None:
+        self.app = app
+        self._origins = origins
+        self._cors: ASGIApp | None = None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if self._cors is None:
+            self._cors = CORSMiddleware(
+                self.app,
+                allow_origins=self._origins(),
+                allow_credentials=False,
+                allow_methods=["*"],
+                allow_headers=["*"],
+                expose_headers=["Retry-After"],
+            )
+        await self._cors(scope, receive, send)
 
 
 def create_app(
@@ -89,15 +121,11 @@ def create_app(
     def _max_body_bytes() -> int:
         return (app.state.settings or get_settings()).max_request_body_bytes
 
+    def _cors_origins() -> list[str]:
+        return (app.state.settings or get_settings()).cors_origins
+
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=_max_body_bytes)
-    # CORS — permissive for development, tighten in production (M8)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    app.add_middleware(_SettingsCORS, origins=_cors_origins)
     install_error_handlers(app)
 
     # Health endpoints at root level; research under /api/v1/research.

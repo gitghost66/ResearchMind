@@ -57,9 +57,17 @@ from researchmind_agents.state import (
     PlanOutput,
     ResearchState,
     SubQuestionItem,
+    stable_id,
 )
 
-__all__ = ["AGENT", "make_planner_node", "normalize_plan", "normalize_gap_plan", "fallback_plan"]
+__all__ = [
+    "AGENT",
+    "make_planner_node",
+    "normalize_plan",
+    "normalize_gap_plan",
+    "fallback_plan",
+    "with_stable_ids",
+]
 
 _QUICK = MODES["quick"]
 
@@ -130,6 +138,7 @@ async def _first_round(runtime: AgentRuntime, state: ResearchState) -> dict[str,
     if fallback_reason is not None:
         await log.error("Planner fell back to a single-question plan", reason=fallback_reason)
         objective, items = fallback_plan(question, profile=profile)
+    items = with_stable_ids(items, run_id=run_id, iteration=0)
 
     plan = {
         "objective": objective,
@@ -201,6 +210,20 @@ def normalize_plan(
     return objective, items
 
 
+def with_stable_ids(
+    items: list[SubQuestionItem], *, run_id: str, iteration: int
+) -> list[SubQuestionItem]:
+    """
+    Key each sub-question by run, round, and position. A planner re-run after
+    a resume then stores the same IDs, replacing its first attempt's rows
+    rather than adding a second set.
+    """
+    return [
+        item.model_copy(update={"id": stable_id(run_id, "sub_question", iteration, index)})
+        for index, item in enumerate(items)
+    ]
+
+
 def fallback_plan(
     question: str, *, profile: ModeProfile = _QUICK
 ) -> tuple[str, list[SubQuestionItem]]:
@@ -258,12 +281,16 @@ async def _gap_round(runtime: AgentRuntime, state: ResearchState) -> dict[str, A
                 )
             llm_calls.append(llm_call_record(response.usage, prompt_version=GAP_PROMPT_VERSION))
             if response.parsed is not None:
-                added = normalize_gap_plan(
-                    response.parsed,
-                    existing=existing,
-                    gaps=gaps,
-                    config=config,
-                    profile=profile,
+                added = with_stable_ids(
+                    normalize_gap_plan(
+                        response.parsed,
+                        existing=existing,
+                        gaps=gaps,
+                        config=config,
+                        profile=profile,
+                        iteration=iteration,
+                    ),
+                    run_id=run_id,
                     iteration=iteration,
                 )
             if not added:

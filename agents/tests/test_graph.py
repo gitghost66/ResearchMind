@@ -14,9 +14,11 @@ documented formula applied to the report's own claims.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 from collections import Counter
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -790,3 +792,92 @@ class TestDecisionMode:
         grounding = check_grounding(state["report"], state["report_markdown"], stored)
         assert grounding.citation_resolution_rate == 1.0
         assert grounding.cited_statement_rate == 1.0
+
+
+# ---------------------------------------------------------------------------
+# M8: resuming from a checkpoint
+# ---------------------------------------------------------------------------
+
+
+class _HeldLLM(ScriptedLLM):
+    """Calls for the schema named ``held`` wait for ``gate``."""
+
+    def __init__(self, *args: Any, held: str, gate: asyncio.Event, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.held = held
+        self.gate = gate
+        self.reached = asyncio.Event()
+
+    async def _complete(self, **kwargs: Any) -> Any:
+        schema = kwargs.get("json_schema")
+        if schema is not None and schema.__name__ == self.held:
+            self.reached.set()
+            await self.gate.wait()
+        return await super()._complete(**kwargs)
+
+
+def held_runtime(store: InMemoryResearchStore, *, held: str) -> tuple[AgentRuntime, _HeldLLM]:
+    runtime = build_fake_runtime(web=web(), store=store)
+    llm = _HeldLLM(
+        replace(runtime.config.llm, base_delay=0.0, overload_delay=0.0),
+        runtime.budget.wrap(None),
+        held=held,
+        gate=asyncio.Event(),
+    )
+    runtime.llm = llm
+    return runtime, llm
+
+
+class TestResume:
+    async def test_an_interrupted_run_resumes_without_redoing_finished_steps(self) -> None:
+        saver, store = InMemorySaver(), InMemoryResearchStore()
+        first, held = held_runtime(store, held="ReportOutput")
+        task = asyncio.create_task(
+            run_research(first, run_id="run-resume", question=QUESTION, checkpointer=saver)
+        )
+        await asyncio.wait_for(held.reached.wait(), 10)
+        task.cancel()  # the worker dies at the synthesizer
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        assert held.calls_for("PlanOutput") and "report" not in store.reports
+
+        second = build_fake_runtime(web=web(), store=store)
+        state = await run_research(second, run_id="run-resume", question=QUESTION, checkpointer=saver)
+
+        assert state["report"]["question"] == QUESTION
+        # Only the step that was cut short ran again.
+        assert llm_of(second).calls_for("PlanOutput") == []
+        assert llm_of(second).calls_for("SourceSelection") == []
+        assert len(llm_of(second).calls_for("ReportOutput")) == 1
+        # Every citation still resolves to a source the first attempt stored.
+        grounding = check_grounding(state["report"], state["report_markdown"], set(store.sources))
+        assert grounding.citation_resolution_rate == 1.0
+
+    async def test_a_finished_run_is_not_run_again(self) -> None:
+        saver, store = InMemorySaver(), InMemoryResearchStore()
+        done = await run_research(
+            build_fake_runtime(web=web(), store=store),
+            run_id="run-done",
+            question=QUESTION,
+            checkpointer=saver,
+        )
+
+        again = build_fake_runtime(web=web(), store=store)
+        state = await run_research(again, run_id="run-done", question=QUESTION, checkpointer=saver)
+
+        assert llm_of(again).calls == []
+        assert state["report"] == done["report"]
+
+    async def test_a_replanned_round_reuses_its_sub_question_ids(self) -> None:
+        """A planner re-run (after a resume) stores the same IDs, so no second set of rows."""
+        store = InMemoryResearchStore()
+        first = await run_research(
+            build_fake_runtime(web=web(), store=store), run_id="run-ids", question=QUESTION
+        )
+        again = await run_research(
+            build_fake_runtime(web=web(), store=store), run_id="run-ids", question=QUESTION
+        )
+
+        ids = [sq["id"] for sq in first["sub_questions"]]
+        assert ids == [sq["id"] for sq in again["sub_questions"]]
+        assert len(store.sub_questions) == len(ids)

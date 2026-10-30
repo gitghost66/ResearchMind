@@ -4,12 +4,68 @@ A multi-agent AI research system that decomposes complex questions, researches t
 
 ## Quick Start
 
-### Prerequisites
+### With Docker (fresh clone, nothing else to install)
+
+Needs [Docker](https://docs.docker.com/get-docker/) and a
+[Google AI Studio](https://aistudio.google.com) API key. This runs the
+production layout on your machine: Nginx, the API, two research workers, and a
+local PostgreSQL with pgvector.
+
+```bash
+git clone <this repository> researchmind && cd researchmind
+cp .env.example backend/.env
+# In backend/.env set GEMINI_API_KEY, and API_KEY to any secret clients will send.
+
+docker compose -f docker-compose.prod.yml -f docker-compose.localdb.yml up -d --build
+
+curl http://localhost:8080/ready
+# => {"status": "ready", "checks": {"database": "ok", ...}, "runs": {"queued": 0, "running": 0}, "listening": true}
+```
+
+Port 8080 taken? Run with `HTTP_PORT=8090` (any free port) in front of the
+command.
+
+Then try the [API](#research-api-m4-m6-m8) on `http://localhost:8080`. Check
+the whole deployment with the smoke tests (they start real runs, so they spend
+a few model calls):
+
+```bash
+python backend/scripts/smoke_test.py --base-url http://localhost:8080 --api-key <API_KEY> api
+python backend/scripts/smoke_test.py --base-url http://localhost:8080 --api-key <API_KEY> restart \
+    --kill "docker compose -f docker-compose.prod.yml -f docker-compose.localdb.yml kill -s SIGKILL worker" \
+    --start "docker compose -f docker-compose.prod.yml -f docker-compose.localdb.yml up -d --no-deps worker"
+```
+
+The second kills every worker in the middle of a run and starts new ones; the
+run resumes from its last checkpoint once the dead workers' lease lapses
+(`RUN_LEASE_SECONDS`, 60 s by default) and finishes without redoing the steps
+that were done. Stop the stack with `docker compose -f docker-compose.prod.yml -f docker-compose.localdb.yml down`
+(add `-v` to delete the database).
+
+To use your own database (Supabase, RDS) instead, set `DATABASE_URL` in
+`backend/.env` and leave out `-f docker-compose.localdb.yml`; the `migrate`
+service applies the migrations either way. Deploying to AWS:
+[docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md).
+
+### The web UI
+
+A dark-theme React app in `frontend/` (see [frontend/README.md](frontend/README.md)):
+start runs, follow them live, read reports, explore the evidence graph.
+
+```bash
+cd backend && uvicorn app.main:app --port 8000 --timeout-graceful-shutdown 5   # the API
+cd frontend && npm install && npm run dev                                     # http://localhost:5173
+```
+
+### Without Docker (development)
+
+#### Prerequisites
 - Python 3.11+
-- A [Supabase](https://supabase.com) project (free tier works)
+- A [Supabase](https://supabase.com) project (free tier works), or any
+  PostgreSQL 16 with pgvector
 - A [Google AI Studio](https://aistudio.google.com) API key
 
-### Setup
+#### Setup
 
 1. **Clone and install dependencies:**
    ```bash
@@ -36,7 +92,8 @@ A multi-agent AI research system that decomposes complex questions, researches t
    alembic upgrade head
    ```
 
-4. **Run the API** — one worker: research runs execute inside the API process.
+4. **Run the API.** By default it also runs a research worker
+   (`RUN_WORKER_IN_API=true`), so this one process is enough.
    ```bash
    cd backend
    uvicorn app.main:app --reload --port 8000 --timeout-graceful-shutdown 5
@@ -47,12 +104,19 @@ A multi-agent AI research system that decomposes complex questions, researches t
    Without `DATABASE_URL` the API still starts, but the research endpoints
    answer 503.
 
+   To run research in separate processes instead, set `RUN_WORKER_IN_API=false`
+   and start as many workers as you like:
+   ```bash
+   cd backend
+   python -m app.workers.research_worker
+   ```
+
 5. **Verify:**
    ```bash
    curl http://localhost:8000/health
    # => {"status": "healthy"}
    curl http://localhost:8000/ready
-   # => {"status": "ready", "checks": {"database": "ok", ...}, "runs": {...}}
+   # => {"status": "ready", "checks": {"database": "ok", ...}, "runs": {...}, "worker": {...}}
    ```
    Interactive API docs are at http://localhost:8000/docs.
 
@@ -95,6 +159,49 @@ test the synthesizer.
 passages, events, usage, and report to `DATABASE_URL`; apply migrations first
 with `cd backend && alembic upgrade head`. The default, `auto`, uses the
 database when `DATABASE_URL` is set.
+
+### Run the benchmark (M7)
+
+One command compares ResearchMind with a closed-book LLM (one prompt, no
+retrieval) and a single-agent RAG baseline (one search, one cited answer) on 40
+questions, 10 per mode, and writes the comparison table for the project report:
+
+```bash
+python -m researchmind_agents.evals run --suite default
+
+# A slice: one mode, or a few questions; --systems picks a subset
+python -m researchmind_agents.evals run --suite default --modes quick --limit 3
+
+# Continue an interrupted run (results are saved after every answer)
+python -m researchmind_agents.evals run --resume agents/researchmind_agents/evals/results/<run>
+
+# The whole harness on scripted fakes: no network, no API keys (what CI runs)
+python -m researchmind_agents.evals run --suite offline
+```
+
+Each run gets its own directory under `agents/researchmind_agents/evals/results/`:
+`results.md` (the tables), `results.json` (aggregates and one row per answer),
+`spot_check.jsonl`, `meta.json`, and `details.jsonl` (every judged sentence; not
+committed). Answers are scored by an LLM-as-judge with versioned prompts
+(`eval_support/v1`, `eval_coverage/v2`), separate from ResearchMind's own fact
+checker; set `EVAL_JUDGE_MODEL` to judge with a different model. Metrics:
+faithfulness, citation precision, fabricated citations, hallucination rate,
+completeness, relevance, Precision@K/Recall@K/MRR against hand-labelled gold
+sources, task completion, rounds, latency, tokens, and cost. Definitions are at
+the end of every `results.md` and in `evals/metrics.py`.
+
+Check the judge by hand: set `human_stance` (`supports`, `contradicts`, or
+`neutral`) on the lines of `spot_check.jsonl`, then
+
+```bash
+python -m researchmind_agents.evals agreement agents/researchmind_agents/evals/results/<run>
+```
+
+The CLI gets its settings (keys, models) from `backend/.env` through an entry
+point the backend registers, so install the backend first (`pip install -e backend`).
+A full run makes over a thousand model calls (a quick-mode question took 18 calls and
+about 3 minutes in the first live test); on Gemini's free tier expect several hours,
+and use `--resume` if a daily quota stops it.
 
 ### Run Tests
 ```bash
@@ -234,7 +341,7 @@ Formulas and weights are documented in
   by `CONFIDENCE_CONTRADICTION_PENALTY` per unresolved contradiction (up to the
   cap).
 
-## Research API (M4, M6)
+## Research API (M4, M6, M8)
 
 Every `/api/v1/research` route needs the `X-API-Key` header (when `API_KEY` is
 set) and counts against a per-key rate limit. Errors always look like
@@ -251,15 +358,30 @@ set) and counts against a per-key rate limit. Errors always look like
 | GET | `/api/v1/research/{id}/sources` | Stored sources with type, reliability score, publication date, passage counts, and whether the report cites them |
 | GET | `/api/v1/research/{id}/usage` | Calls, tokens, cost, and latency — total, per agent, per model |
 | POST | `/api/v1/research/{id}/cancel` | Cancel a queued or running run (409 if it already ended) |
+| POST | `/api/v1/research/{id}/resume` | Resume a failed run from its last checkpoint → 202 (409 unless it failed) |
 | DELETE | `/api/v1/research/{id}` | Cancel if active, then delete the run and all its data (204) |
 
 ```bash
+API=http://localhost:8000          # http://localhost:8080 for the Docker stack
 KEY="X-API-Key: your-api-key-for-clients"
-RUN=$(curl -s -H "$KEY" -H "Content-Type: application/json"   -d '{"question": "Is RAG better than fine-tuning for enterprise QA?"}'   http://localhost:8000/api/v1/research | python -c "import sys, json; print(json.load(sys.stdin)['run_id'])")
 
-curl -N -H "$KEY" http://localhost:8000/api/v1/research/$RUN/events   # live progress
-curl -s -H "$KEY" http://localhost:8000/api/v1/research/$RUN/report   # once it completes
-curl -s -X POST -H "$KEY" http://localhost:8000/api/v1/research/$RUN/cancel
+# Start a run (mode: quick | deep | academic | decision)
+RUN=$(curl -s -H "$KEY" -H "Content-Type: application/json" \
+  -d '{"question": "PostgreSQL or MongoDB for an AI SaaS?", "mode": "decision",
+       "user_context": {"team": "3 backend engineers"}}' \
+  $API/api/v1/research | python -c "import sys, json; print(json.load(sys.stdin)['run_id'])")
+
+curl -N -H "$KEY" $API/api/v1/research/$RUN/events     # live progress (SSE)
+curl -s -H "$KEY" $API/api/v1/research/$RUN            # status and progress per step
+curl -s -H "$KEY" $API/api/v1/research/$RUN/report     # once it completes
+curl -s -H "$KEY" $API/api/v1/research/$RUN/sources    # sources with reliability scores
+curl -s -H "$KEY" $API/api/v1/research/$RUN/graph      # evidence graph
+curl -s -H "$KEY" $API/api/v1/research/$RUN/usage      # tokens and cost per agent
+curl -s -H "$KEY" "$API/api/v1/research?status=completed&limit=10"
+
+curl -s -X POST -H "$KEY" $API/api/v1/research/$RUN/cancel
+curl -s -X POST -H "$KEY" $API/api/v1/research/$RUN/resume   # a failed run only
+curl -s -X DELETE -H "$KEY" $API/api/v1/research/$RUN
 ```
 
 **Evidence graph.** Nodes are `{id, type, label, meta}` with `type` one of
@@ -279,8 +401,12 @@ event sequence number (`seq`, 1, 2, 3, ...). Types include `run_status`
 reliability), `claims_extracted`, `claim_verified` (verdict and confidence),
 `contradiction_found` (claims, likely cause, resolved), `sufficiency_checked`
 (the round's gaps and whether another round runs), `report_ready`, and `error`
-(an agent hit a problem; the run continues). The stream closes after
-the terminal `run_status`. To resume after a dropped connection, send
+(an agent hit a problem; the run continues). A resumed run's `run_status`
+carries `"resumed": true` and its `attempt`, and a step its interruption cut
+short gets an `agent_finished` with `"status": "interrupted"` before it runs
+again. The stream closes after the terminal `run_status` — unless the run went
+on (a failed run resumed through `/resume`), in which case it follows the run to
+its next end. To resume after a dropped connection, send
 `Last-Event-ID: <seq>` (browsers' `EventSource` does this itself) or
 `?after=<seq>`. `EventSource` cannot send `X-API-Key`, so a web client should
 use a fetch-based SSE client.
@@ -288,17 +414,36 @@ use a fetch-based SSE client.
 **Limits.** `MAX_QUESTION_CHARS`, `MAX_USER_CONTEXT_BYTES`,
 `MAX_REQUEST_BODY_BYTES` (413), `MAX_SOURCES_LIMIT`; `RATE_LIMIT_REQUESTS` and
 `RATE_LIMIT_RUNS` per `RATE_LIMIT_WINDOW_SECONDS` (429 with `Retry-After`);
-`MAX_CONCURRENT_RUNS` run at once and up to `MAX_PENDING_RUNS` wait (503 beyond).
+each worker runs `MAX_CONCURRENT_RUNS` at once, and up to `MAX_PENDING_RUNS` may
+be queued or running in total (503 beyond). Rate limits are per API process.
+`CORS_ALLOW_ORIGINS` lists the browser origins allowed to call the API.
 
-**Durability.** Runs are asyncio tasks in the API process. On shutdown they
-are recorded as failed ("interrupted") — serve with
-`--timeout-graceful-shutdown` so open event streams do not hold shutdown until
-their runs finish. On startup, any run a crashed process left queued or running
-is marked failed the same way, so no run stays stuck. Resuming interrupted runs
-from a checkpoint is M8. Until then, run a single API worker: the job registry,
-rate limits, and live event wake-ups are per process. For the same reason, do
-not start the API while `run_mvp.py` is running against the same database: the
-startup sweep would mark the script's run failed.
+**Durability (M8).** Runs live in the database, not in a process. Creating a
+run queues it; a worker (inside the API, or `python -m
+app.workers.research_worker`, as many as you like) claims it under a lease and
+renews the lease while it works. Every step of the graph is checkpointed to the
+database before the next one starts, so:
+
+* **A worker that dies** (crash, `SIGKILL`, lost host) stops renewing; once its
+  lease lapses (`RUN_LEASE_SECONDS`), another worker resumes the run from its
+  last checkpoint. Finished steps are not run again; in a parallel step only the
+  branches that had not finished re-run, and rows they had stored are replaced,
+  not duplicated. The resumed run's budget counts what earlier attempts spent.
+  A run interrupted `MAX_RUN_ATTEMPTS` times is failed instead.
+* **A worker that stops cleanly** (`SIGTERM`, a deploy) hands its runs back at
+  once, so another worker picks them up without waiting for the lease.
+* **A failed run** (for example, the model's daily quota ran out) can be resumed
+  with `POST /{id}/resume`.
+* **Cancelling** works from any API process: the run's worker, wherever it is,
+  is told through PostgreSQL `LISTEN/NOTIFY` and stops within moments (at the
+  latest at its next lease renewal).
+
+Event streams also go through `LISTEN/NOTIFY`, so any API process streams a run
+executed by any worker. Supabase's transaction pooler (port 6543) cannot
+`LISTEN`: set `DATABASE_LISTEN_URL` to the session pooler (port 5432) or a
+direct connection, or streams fall back to polling every
+`SSE_POLL_INTERVAL_SECONDS`. Completed and cancelled runs drop their checkpoints;
+failed ones keep them so they can be resumed.
 
 **Tracing.** Set `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` to send each
 run to LangSmith as one trace (named `research:<mode>`, tagged with its
@@ -306,22 +451,64 @@ run to LangSmith as one trace (named `research:<mode>`, tagged with its
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    client([Client]) -- "REST + SSE<br/>X-API-Key" --> nginx[Nginx<br/>TLS, SSE pass-through]
+    nginx --> api["API processes<br/>FastAPI · uvicorn --workers N"]
+
+    subgraph pg [PostgreSQL 16 + pgvector]
+        runs[("research_runs<br/>queue + leases")]
+        data[("sources · passages (vectors)<br/>claims · contradictions · reports")]
+        events[("run_events<br/>(seq order)")]
+        ckpt[("graph checkpoints")]
+    end
+
+    api -- "create: queued run" --> runs
+    api -- "stream: read by seq" --> events
+    workers["Research workers<br/>python -m app.workers.research_worker"] -- "claim under a lease,<br/>renew, resume lapsed" --> runs
+    workers -- "LangGraph run:<br/>planner → researchers → claims →<br/>fact check → contradictions → loop → report" --> data
+    workers -- "progress events" --> events
+    workers -- "a checkpoint per step" --> ckpt
+    pg -. "LISTEN/NOTIFY:<br/>new events, status changes" .-> api
+    pg -. "LISTEN/NOTIFY:<br/>queued, cancelled" .-> workers
+
+    workers --> llm["Gemini<br/>(or any OpenAI-compatible API)"]
+    workers --> web["Web search + page fetches<br/>(SSRF-pinned)"]
+    workers --> papers["arXiv + Semantic Scholar"]
 ```
-Client ──REST──► FastAPI ──asyncio task (JobRunner)──► LangGraph workflow
-   ▲               │  ▲                                   │      │
-   │ SSE           │  └──── wake-up on each new event ────┤      ├──► Gemini API
-   └─ run_events ──┘                                      │      ├──► web search + pages
-                                                          │      └──► arXiv + Semantic Scholar
-      (seq order)  ▼                                      ▼
-            Supabase PostgreSQL + pgvector  ◄── runs, sources, passages, claims, contradictions,
-                                                events, usage, reports
-```
+
+* **API processes** validate requests, queue runs, and serve reads and event
+  streams. They hold no run state, so any number can run behind Nginx or a load
+  balancer.
+* **Workers** take runs from the database (`research_runs` is the queue), run the
+  LangGraph workflow from the `agents` package, and checkpoint every step. A
+  worker can also run inside the API process (`RUN_WORKER_IN_API`), which is the
+  one-container setup used in development.
+* **PostgreSQL** is the only shared state: runs and their leases, evidence and
+  vectors, the ordered event log the streams replay, and the checkpoints runs
+  resume from. `LISTEN/NOTIFY` carries wake-ups between processes; everything
+  still works by polling without it.
+* **Package boundary:** `agents/` holds the graph, prompts, and tools and never
+  imports the backend; `backend/` holds HTTP, database, and process lifecycle,
+  and contains no prompts or agent logic (see `AGENTS.md`).
+
+## Deployment
+
+* **One machine (EC2 or any VM):** `docker compose -f docker-compose.prod.yml up -d`
+  with `DATABASE_URL` pointing at a managed PostgreSQL. Scale with
+  `API_PROCESSES` (uvicorn processes) and `WORKER_REPLICAS`.
+* **Containers (ECS Fargate):** one image, two services (API and worker), a
+  one-off migration task, an ALB in front.
+
+Step-by-step for both, with RDS and Supabase, secrets, TLS, and logs:
+[docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md). Logs are one JSON object per line,
+with `run_id` and `worker_id` on every line written inside a run.
 
 ## Project Structure
 
 - `backend/` — FastAPI REST API, database models, services
 - `agents/` — LangGraph agent workflow, LLM wrapper, tools, prompts
-- `frontend/` — Placeholder (built in a later phase)
+- `frontend/` — React + Vite web UI (dark theme), talking to the API
 
 ## Milestones
 
@@ -341,8 +528,17 @@ Client ──REST──► FastAPI ──asyncio task (JobRunner)──► LangG
       likely causes; sufficiency check and gap-filling loop; `decision` mode;
       per-mode planner bounds and loop deadlines; `/graph` endpoint). Live
       contradiction eval and latency checks pending.
-- [ ] **M7** — Evaluation framework
-- [ ] **M8** — Hardening and deployment
+- [x] **M7** — Evaluation framework (40-question benchmark across the four
+      modes; closed-book and single-agent RAG baselines; LLM-as-judge with
+      versioned prompts and a spot-check sample; retrieval, answer-quality, and
+      operations metrics; `python -m researchmind_agents.evals`). Live benchmark
+      run pending.
+- [x] **M8** — Hardening and deployment (database-backed run queue with worker
+      leases; resume from LangGraph checkpoints after a worker dies, a clean
+      shutdown, or `POST /resume`; `LISTEN/NOTIFY` for streams and cancels across
+      processes; SSRF connections pinned to the vetted address; configurable
+      CORS; `run_id`/`worker_id` on every log line; multi-stage Dockerfile,
+      Nginx, production compose, AWS guide, smoke tests)
 
 ## License
 

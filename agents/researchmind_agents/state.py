@@ -17,6 +17,7 @@ including the strict msgpack mode that refuses arbitrary classes.
 from __future__ import annotations
 
 import operator
+import uuid
 from typing import Annotated, Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
@@ -54,6 +55,7 @@ __all__ = [
     "ContradictionOutput",
     "SufficiencyOutput",
     # Records
+    "stable_id",
     "SubQuestionItem",
     "SourceItem",
     "PassageItem",
@@ -251,6 +253,19 @@ class SufficiencyOutput(BaseModel):
 # ---------------------------------------------------------------------------
 # Records
 # ---------------------------------------------------------------------------
+
+_ID_NAMESPACE = uuid.UUID("5d2f7a0e-3c1b-4e8a-9f6d-2a7c4b1e8d93")
+
+
+def stable_id(*parts: object) -> str:
+    """
+    A UUID derived from *parts*: the same parts always give the same ID.
+
+    Rows a node stores are keyed this way when the node can run twice for the
+    same input: after a resume, an interrupted step runs again, and its rows
+    then replace the first attempt's instead of duplicating them.
+    """
+    return str(uuid.uuid5(_ID_NAMESPACE, "".join(str(part) for part in parts)))
 
 
 class SubQuestionItem(BaseModel):

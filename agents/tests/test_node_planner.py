@@ -15,6 +15,7 @@ from researchmind_agents.state import (
     PlanOutput,
     SubQuestionItem,
     new_research_state,
+    stable_id,
 )
 from researchmind_agents.storage import InMemoryResearchStore
 from researchmind_agents.testing import ScriptedLLM, build_fake_runtime
@@ -529,3 +530,39 @@ class TestGapRound:
         update = await run_gap_round(runtime, [SQ_GAP])
         assert [sq["id"] for sq in update["sub_questions"]] == ["sq0"]
         assert any(e["type"] == "error" for e in update["events"])
+
+
+class TestStableIds:
+    """M8: a planner re-run after a resume must not store a second set of sub-questions."""
+
+    async def test_ids_come_from_run_round_and_position(self) -> None:
+        runtime = build_fake_runtime(
+            responses={"PlanOutput": plan_json([{"text": "A?", "queries": ["a"]}, {"text": "B?", "queries": ["b"]}])}
+        )
+        update = await run_planner(runtime)
+        assert [sq["id"] for sq in update["sub_questions"]] == [
+            stable_id("run-1", "sub_question", 0, 0),
+            stable_id("run-1", "sub_question", 0, 1),
+        ]
+
+    async def test_a_re_run_replaces_its_rows(self) -> None:
+        runtime = build_fake_runtime(
+            responses={"PlanOutput": [plan_json([{"text": "A?", "queries": ["a"]}]), plan_json([{"text": "A again?", "queries": ["a"]}])]}
+        )
+        first = await run_planner(runtime)
+        second = await run_planner(runtime)
+        assert first["sub_questions"][0]["id"] == second["sub_questions"][0]["id"]
+        rows = store_of(runtime).sub_questions
+        assert len(rows) == 1 and next(iter(rows.values()))["text"] == "A again?"
+
+    async def test_the_fallback_plan_is_keyed_the_same_way(self) -> None:
+        runtime = build_fake_runtime(responses={"PlanOutput": RuntimeError("down")})
+        update = await run_planner(runtime)
+        assert update["sub_questions"][0]["id"] == stable_id("run-1", "sub_question", 0, 0)
+
+    async def test_gap_round_ids_include_the_round(self) -> None:
+        runtime = build_fake_runtime(
+            responses={"GapPlanOutput": gap_json({"text": "New?", "queries": ["new"], "gap": "G2"})}
+        )
+        update = await run_gap_round(runtime, [TOPIC_GAP], iteration=2)
+        assert update["sub_questions"][-1]["id"] == stable_id("run-1", "sub_question", 2, 0)

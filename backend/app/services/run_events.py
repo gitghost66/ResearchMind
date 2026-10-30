@@ -7,16 +7,21 @@ backend — goes through :class:`RunEventRecorder`, which
 * numbers it with the run's next ``seq`` and commits it while holding a
   per-run lock, so commit order equals ``seq`` order and a reader polling
   ``seq > n`` can never skip an event that committed late;
-* then wakes SSE listeners in this process through :class:`EventNotifier`.
+* then wakes listeners through :class:`EventNotifier`.
 
-A status change and its ``run_status`` event commit in one transaction, and a
-run that reached a terminal status never changes again — so a late write (say,
-"completed" racing a cancel) cannot flip a finished run.
+A status change and its ``run_status`` event commit in one transaction. A run
+that reached a terminal status changes again only through an explicit resume
+(``failed`` -> ``queued``), so a late write (say, "completed" racing a cancel)
+cannot flip a finished run. A worker finishing a run also names itself as the
+owner, so a worker that lost its lease cannot settle a run another resumed.
 
-The database is the source of truth: a woken listener re-reads ``seq > n``; the
-notifier only spares it from polling. Events written by another process (for
-example ``run_mvp.py``) still reach a stream through its fallback poll. M8 swaps
-the notifier for Postgres LISTEN/NOTIFY so several API workers can share runs.
+The database is the source of truth: a woken listener re-reads ``seq > n``;
+notifications only spare it from polling. On PostgreSQL every write also
+sends ``NOTIFY`` in its transaction (delivered on commit): ``rm_run_events``
+with the run ID, and for status changes ``rm_run_status`` with
+``"<run_id>:<status>"``. ``app.services.pg_listener`` turns those back into
+notifier calls in every API and worker process, which is how a stream served by
+one process sees events written by a worker in another.
 
 No prompt text or agent logic here (AGENTS.md rule 2).
 """
@@ -27,14 +32,15 @@ import asyncio
 import logging
 import uuid
 import weakref
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql import ColumnElement
 
 from app.models.research import ResearchRun, RunEvent
 from app.repositories.research_repository import RunEventRepository
@@ -43,12 +49,15 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ACTIVE_STATUSES",
+    "EVENTS_CHANNEL",
     "INTERRUPTED_ERROR",
     "RUNNER_AGENT",
     "RUN_STATUS_EVENT",
+    "STATUS_CHANNEL",
     "TERMINAL_STATUSES",
     "EventNotifier",
     "RunEventRecorder",
+    "StatusCallback",
     "event_to_dict",
 ]
 
@@ -61,9 +70,15 @@ RUNNER_AGENT = "runner"
 
 INTERRUPTED_ERROR = "Interrupted: the server stopped before the run finished."
 
+# PostgreSQL NOTIFY channels (see the module docstring).
+EVENTS_CHANNEL = "rm_run_events"
+STATUS_CHANNEL = "rm_run_status"
+
 # A seq collision means another recorder (or process) got there first;
 # re-read and retry. Within one recorder the per-run lock prevents collisions.
 _MAX_WRITE_ATTEMPTS = 5
+
+StatusCallback = Callable[[str, str], None]
 
 
 def _uuid(value: str | uuid.UUID) -> uuid.UUID:
@@ -83,14 +98,25 @@ def event_to_dict(event: RunEvent) -> dict[str, Any]:
 
 
 class EventNotifier:
-    """In-process wake-ups for streams waiting on a run's next event."""
+    """
+    In-process wake-ups: streams waiting on a run's next event, and
+    subscribers (workers) told about status changes. Fed by this process's own
+    writes and, on PostgreSQL, by the LISTEN connection for other processes'.
+    """
 
     def __init__(self) -> None:
         self._listeners: dict[str, set[asyncio.Event]] = {}
+        self._status_subscribers: list[StatusCallback] = []
 
     def notify(self, run_id: str) -> None:
         for listener in self._listeners.get(str(run_id), ()):
             listener.set()
+
+    def wake_all(self) -> None:
+        """Wake every stream (after a lost LISTEN connection, events may have been missed)."""
+        for listeners in self._listeners.values():
+            for listener in listeners:
+                listener.set()
 
     @contextmanager
     def listen(self, run_id: str) -> Iterator[asyncio.Event]:
@@ -109,6 +135,29 @@ class EventNotifier:
 
     def listener_count(self, run_id: str) -> int:
         return len(self._listeners.get(str(run_id), ()))
+
+    def notify_status(self, run_id: str, status: str) -> None:
+        for callback in list(self._status_subscribers):
+            try:
+                callback(str(run_id), status)
+            except Exception:  # noqa: BLE001 - one subscriber must not break the others
+                logger.exception("Status subscriber failed for run %s", run_id)
+
+    def subscribe_status(self, callback: StatusCallback) -> Callable[[], None]:
+        """Call *callback(run_id, status)* on every status change; returns an unsubscribe."""
+        self._status_subscribers.append(callback)
+
+        def unsubscribe() -> None:
+            if callback in self._status_subscribers:
+                self._status_subscribers.remove(callback)
+
+        return unsubscribe
+
+
+async def _pg_notify(session: AsyncSession, channel: str, payload: str) -> None:
+    """NOTIFY on PostgreSQL, sent when the transaction commits; nothing elsewhere."""
+    if session.get_bind().dialect.name == "postgresql":
+        await session.execute(select(func.pg_notify(channel, payload)))
 
 
 class RunEventRecorder:
@@ -159,6 +208,7 @@ class RunEventRecorder:
                             key, agent, event_type, dict(payload or {})
                         )
                         seq = event.seq
+                        await _pg_notify(session, EVENTS_CHANNEL, key)
                         await session.commit()
                     break
                 except IntegrityError:
@@ -175,7 +225,7 @@ class RunEventRecorder:
         user_context: dict[str, Any] | None = None,
         options: dict[str, Any] | None = None,
     ) -> str:
-        """Insert a ``queued`` run and its first ``run_status`` event."""
+        """Insert a ``queued`` run and its first ``run_status`` event; wakes workers."""
         async with self._session_factory() as session:
             run = ResearchRun(
                 question=question,
@@ -186,6 +236,7 @@ class RunEventRecorder:
             )
             session.add(run)
             await session.flush()
+            key = str(run.id)
             session.add(
                 RunEvent(
                     run_id=run.id,
@@ -195,8 +246,11 @@ class RunEventRecorder:
                     payload={"status": "queued", "error": None},
                 )
             )
+            await _pg_notify(session, STATUS_CHANNEL, f"{key}:queued")
             await session.commit()
-            return str(run.id)
+        self.notifier.notify(key)
+        self.notifier.notify_status(key, "queued")
+        return key
 
     async def transition(
         self,
@@ -205,6 +259,10 @@ class RunEventRecorder:
         *,
         error: str | None = None,
         from_statuses: Collection[str] = ACTIVE_STATUSES,
+        owner: str | None = None,
+        values: Mapping[str, Any] | None = None,
+        where: Sequence[ColumnElement[bool]] = (),
+        details: Mapping[str, Any] | None = None,
     ) -> bool:
         """
         Move the run to *status* if it is currently in *from_statuses*.
@@ -212,16 +270,33 @@ class RunEventRecorder:
         Returns whether it moved. The update and its ``run_status`` event
         commit together; a run that is missing, or not in *from_statuses*, is
         left alone and no event is written.
+
+        * *owner* — only if the run's ``worker_id`` is this worker.
+        * *values* — further columns to set (a claim's lease, a resume's reset).
+        * *where* — further conditions (a lapsed lease).
+        * *details* — extra fields for the event's payload.
+
+        ``started_at`` is set the first time a run starts; a terminal status
+        sets ``finished_at`` and ends the lease.
         """
         key = str(_uuid(run_id))
-        values: dict[str, Any] = {"status": status}
+        now = datetime.now(UTC)
+        changes: dict[str, Any] = {"status": status}
         if status == "running":
-            values["started_at"] = datetime.now(UTC)
+            changes["started_at"] = func.coalesce(ResearchRun.started_at, now)
         if status in TERMINAL_STATUSES:
-            values["finished_at"] = datetime.now(UTC)
+            changes["finished_at"] = now
+            changes["lease_expires_at"] = None
         if error is not None:
-            values["error"] = error
+            changes["error"] = error
+        changes.update(values or {})
 
+        conditions = [ResearchRun.id == _uuid(key), ResearchRun.status.in_(list(from_statuses))]
+        if owner is not None:
+            conditions.append(ResearchRun.worker_id == owner)
+        conditions.extend(where)
+
+        payload: dict[str, Any] = {"status": status, "error": error, **dict(details or {})}
         lock = self._lock(key)
         async with lock:
             for attempt in range(1, _MAX_WRITE_ATTEMPTS + 1):
@@ -229,23 +304,24 @@ class RunEventRecorder:
                     async with self._session_factory() as session:
                         result = await session.execute(
                             update(ResearchRun)
-                            .where(
-                                ResearchRun.id == _uuid(key),
-                                ResearchRun.status.in_(list(from_statuses)),
-                            )
-                            .values(**values)
+                            .where(*conditions)
+                            .values(**changes)
+                            .execution_options(synchronize_session=False)
                         )
                         if not getattr(result, "rowcount", 0):
                             await session.rollback()
                             return False
                         await RunEventRepository(session).log_event(
-                            key, RUNNER_AGENT, RUN_STATUS_EVENT, {"status": status, "error": error}
+                            key, RUNNER_AGENT, RUN_STATUS_EVENT, payload
                         )
+                        await _pg_notify(session, EVENTS_CHANNEL, key)
+                        await _pg_notify(session, STATUS_CHANNEL, f"{key}:{status}")
                         await session.commit()
                     break
                 except IntegrityError:
                     if attempt == _MAX_WRITE_ATTEMPTS:
                         raise
         self.notifier.notify(key)
+        self.notifier.notify_status(key, status)
         logger.info("Run %s is %s", key, status, extra={"run_id": key})
         return True

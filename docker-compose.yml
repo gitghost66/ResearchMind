@@ -1,16 +1,28 @@
+# Development: one container, code reloaded on save.
+#
+#   docker compose up --build
+#
+# The API also runs a research worker (RUN_WORKER_IN_API=true), so nothing
+# else is needed. Settings come from backend/.env (DATABASE_URL: your
+# Supabase project, or any PostgreSQL with pgvector). For the production
+# layout (Nginx, several API processes, separate workers) see
+# docker-compose.prod.yml.
 services:
   api:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      target: dev
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - path: backend/.env
+        required: false
+      - path: .env
+        required: false
     volumes:
       - ./backend/app:/app/backend/app
       - ./agents/researchmind_agents:/app/agents/researchmind_agents
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --timeout-graceful-shutdown 5
-    # uvicorn's 5s for open streams + SHUTDOWN_GRACE_SECONDS for runs to record
-    # being interrupted, before Docker sends SIGKILL.
+    # uvicorn's 5s for open streams + SHUTDOWN_GRACE_SECONDS for the worker to
+    # hand its runs back, before Docker sends SIGKILL.
     stop_grace_period: 30s

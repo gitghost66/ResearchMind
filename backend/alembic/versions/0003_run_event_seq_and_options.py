@@ -1,6 +1,6 @@
 """Order run events per run, and store per-run options
 
-Revision ID: 0003_run_event_seq_and_run_options
+Revision ID: 0003_run_event_seq_and_options
 Revises: 0002_passage_embedding_model
 Create Date: 2026-10-27 12:00:00.000000
 
@@ -20,7 +20,7 @@ from sqlalchemy.dialects import postgresql
 from alembic import op
 
 # revision identifiers, used by Alembic.
-revision: str = "0003_run_event_seq_and_run_options"
+revision: str = "0003_run_event_seq_and_options"
 down_revision: str | None = "0002_passage_embedding_model"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None

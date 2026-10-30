@@ -40,7 +40,14 @@ __all__ = ["ResearchStore", "InMemoryResearchStore"]
 
 
 class ResearchStore(Protocol):
-    """What the backend must provide for the graph to persist a run."""
+    """
+    What the backend must provide for the graph to persist a run.
+
+    Writes keyed by an ID the caller chose (sub-questions, claims,
+    contradictions) replace an existing row with that ID. After a resume, a
+    step that was interrupted runs again with the same IDs, so its rows are
+    overwritten rather than duplicated or rejected.
+    """
 
     async def save_plan(
         self,
@@ -51,7 +58,8 @@ class ResearchStore(Protocol):
         iteration: int = 0,
     ) -> None:
         """
-        Store the plan and create one row per sub-question, using the given IDs.
+        Store the plan and one row per sub-question, using the given IDs
+        (an existing row with the same ID is replaced).
 
         *iteration* is the research round (0 first). A gap-filling round
         passes the whole plan so far, but only its new sub-questions, and the
@@ -77,6 +85,18 @@ class ResearchStore(Protocol):
         """
         ...
 
+    async def list_passages(
+        self, *, run_id: str, source_id: str, sub_question_id: str
+    ) -> list[PassageItem]:
+        """
+        The source's stored passages for one sub-question, by chunk index.
+
+        A research branch re-run after a resume finds its own earlier sources
+        already stored (``created=False``); this is how it gets their passages
+        back instead of losing them.
+        """
+        ...
+
     async def save_passages(
         self,
         *,
@@ -92,7 +112,8 @@ class ResearchStore(Protocol):
         """
         Store claims with their verdicts, confidence, and evidence links
         (``claims`` and ``claim_evidence``). Every evidence passage is a
-        stored passage of the run; one link per (claim, passage).
+        stored passage of the run; one link per (claim, passage). A claim
+        whose ID exists is replaced, links included.
         """
         ...
 
@@ -107,7 +128,11 @@ class ResearchStore(Protocol):
         ...
 
     async def save_report(self, *, run_id: str, report: ResearchReport, markdown: str) -> str:
-        """Store the final report and return its ID."""
+        """
+        Store the report and return its ID. A run that stores a second report
+        (its synthesizer re-ran after a resume) gets a new version; readers
+        take the latest.
+        """
         ...
 
     async def log_event(
@@ -182,6 +207,24 @@ class InMemoryResearchStore:
             self.sources[source.id] = {"run_id": run_id, **source.model_dump()}
             return source.id, True
 
+    async def list_passages(
+        self, *, run_id: str, source_id: str, sub_question_id: str
+    ) -> list[PassageItem]:
+        rows = [
+            row
+            for row in self.passages.values()
+            if row["run_id"] == run_id
+            and row["source_id"] == source_id
+            and row["sub_question_id"] == sub_question_id
+        ]
+        rows.sort(key=lambda row: row["chunk_index"])
+        return [
+            PassageItem.model_validate(
+                {k: v for k, v in row.items() if k in PassageItem.model_fields}
+            )
+            for row in rows
+        ]
+
     async def save_passages(
         self,
         *,
@@ -240,9 +283,11 @@ class InMemoryResearchStore:
 
     async def save_report(self, *, run_id: str, report: ResearchReport, markdown: str) -> str:
         report_id = f"report-{len(self.reports) + 1}"
+        version = 1 + sum(1 for row in self.reports.values() if row["run_id"] == run_id)
         self.reports[report_id] = {
             "id": report_id,
             "run_id": run_id,
+            "version": version,
             "content": report.model_dump(mode="json"),
             "markdown": markdown,
         }

@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
 
+import httpcore
 import httpx
 import pytest
 
@@ -22,9 +23,11 @@ from researchmind_agents.config import PageExtractConfig
 from researchmind_agents.tools.page_extract import (
     PageContent,
     PageExtractTool,
+    PinnedNetworkBackend,
     SSRFError,
     _blocked_network,
     parse_published_date,
+    pinned_transport,
 )
 
 PUBLIC_IP = "93.184.216.34"
@@ -613,3 +616,94 @@ class TestParsePublishedDate:
         assert parse_published_date("2024-01-01", now=datetime(2025, 1, 1)) == (
             "2024-01-01T00:00:00+00:00"
         )
+
+
+# ===========================================================================
+# M8: connections pinned to the vetted address (DNS rebinding)
+# ===========================================================================
+
+
+class _RecordingBackend(httpcore.AsyncNetworkBackend):
+    """Records where a connection would go, then refuses it (no real network)."""
+
+    def __init__(self) -> None:
+        self.connected: list[tuple[str, int]] = []
+
+    async def connect_tcp(self, host: str, port: int, **kwargs: Any) -> httpcore.AsyncNetworkStream:
+        self.connected.append((host, port))
+        raise httpcore.ConnectError("test backend: not connecting")
+
+    async def connect_unix_socket(self, path: str, **kwargs: Any) -> httpcore.AsyncNetworkStream:
+        raise AssertionError("never used")
+
+    async def sleep(self, seconds: float) -> None:
+        return None
+
+
+def resolver(*answers: list[str]) -> Callable[[str, int], Any]:
+    """Each call returns the next answer: a DNS server that changes its mind."""
+    queue = list(answers)
+
+    async def resolve(host: str, port: int) -> list[str]:
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    return resolve
+
+
+class TestPinnedConnections:
+    async def test_connects_to_the_address_it_vetted(self) -> None:
+        inner = _RecordingBackend()
+        backend = PinnedNetworkBackend(inner, resolve=resolver([PUBLIC_IP]))
+        with pytest.raises(httpcore.ConnectError):
+            await backend.connect_tcp("example.com", 443)
+        assert inner.connected == [(PUBLIC_IP, 443)]
+
+    async def test_a_private_answer_at_connect_time_is_refused(self) -> None:
+        inner = _RecordingBackend()
+        backend = PinnedNetworkBackend(inner, resolve=resolver(["10.0.0.5"]))
+        with pytest.raises(SSRFError, match="10.0.0.5"):
+            await backend.connect_tcp("rebind.example", 80)
+        assert inner.connected == []
+
+    async def test_any_private_address_refuses_the_host(self) -> None:
+        inner = _RecordingBackend()
+        backend = PinnedNetworkBackend(inner, resolve=resolver([PUBLIC_IP, "127.0.0.1"]))
+        with pytest.raises(SSRFError):
+            await backend.connect_tcp("mixed.example", 80)
+        assert inner.connected == []
+
+    async def test_ip_literals_are_checked_without_dns(self) -> None:
+        backend = PinnedNetworkBackend(_RecordingBackend(), resolve=resolver([]))
+        with pytest.raises(SSRFError):
+            await backend.connect_tcp("169.254.169.254", 80)
+
+    async def test_unix_sockets_are_refused(self) -> None:
+        with pytest.raises(SSRFError):
+            await PinnedNetworkBackend(_RecordingBackend()).connect_unix_socket("/var/run/docker.sock")
+
+    async def test_dns_rebinding_between_check_and_connect_is_blocked(self) -> None:
+        """The early check sees a public address; the connection would have gone private."""
+        inner = _RecordingBackend()
+        backend = PinnedNetworkBackend(inner, resolve=resolver(["192.168.1.1"]))
+        tool = PageExtractTool(
+            PageExtractConfig(timeout=5, respect_robots=False),
+            client=httpx.AsyncClient(transport=pinned_transport(backend)),
+        )
+        # "evil.example" resolves publicly for the early check (patched_dns).
+        page = await tool.extract("http://evil.example/admin")
+        await tool.aclose()
+
+        assert page.error.startswith("SSRF blocked")
+        assert "192.168.1.1" in page.error
+        assert inner.connected == []
+
+    async def test_the_default_client_uses_a_pinned_transport(self) -> None:
+        """Guards the httpx internals pinned_transport relies on."""
+        tool = PageExtractTool(PageExtractConfig(timeout=5))
+        client = tool._ensure_client()
+        transport = client._transport
+        assert isinstance(transport, httpx.AsyncHTTPTransport)
+        pool = transport._pool
+        assert isinstance(pool, httpcore.AsyncConnectionPool)
+        assert isinstance(pool._network_backend, PinnedNetworkBackend)
+        await tool.aclose()

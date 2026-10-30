@@ -9,6 +9,11 @@ durable, whatever happens to the rest of the run.
 Events go through the process-wide :class:`RunEventRecorder`, which numbers
 them and wakes SSE streams; pass the app's recorder so they share its locks.
 
+Writes keyed by the caller's IDs (sub-questions, claims, contradictions) are
+upserts: after a resume, a step that was interrupted runs again with the same
+IDs and replaces its first attempt's rows. A second report for a run gets the
+next version.
+
 No prompt text or agent logic lives here.
 """
 
@@ -33,11 +38,12 @@ from researchmind_agents.tools.vector_search import (
     VectorSearchResult,
     make_vector_search_fn,
 )
-from sqlalchemy import update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.claims import Claim, ClaimEvidence, Contradiction, ContradictionClaim
-from app.models.research import SubQuestion
+from app.models.evidence import Passage
+from app.models.research import Report, SubQuestion
 from app.repositories.evidence_repository import PassageRepository, SourceRepository
 from app.repositories.research_repository import ReportRepository, ResearchRunRepository
 from app.services.run_events import RunEventRecorder
@@ -57,9 +63,8 @@ class SqlResearchStore:
 
     Source get-or-create is serialised by an ``asyncio.Lock`` held by this
     instance, so concurrent graph branches saving the same URL create exactly
-    one row. That assumes one store per run inside a single process, which
-    holds until M8; multi-worker runs will need a database-level guarantee
-    (a unique constraint or advisory lock) instead.
+    one row. That needs one store per run in one process, which the worker
+    lease guarantees: a run executes in exactly one worker at a time.
     """
 
     def __init__(
@@ -87,16 +92,16 @@ class SqlResearchStore:
             await ResearchRunRepository(session).update(
                 run_uuid, plan=dict(plan), iteration=iteration
             )
-            session.add_all(
-                SubQuestion(
-                    id=_uuid(item.id),
-                    run_id=run_uuid,
-                    text=item.text,
-                    domain=item.domain,
-                    status=item.status,
+            for item in sub_questions:
+                await session.merge(
+                    SubQuestion(
+                        id=_uuid(item.id),
+                        run_id=run_uuid,
+                        text=item.text,
+                        domain=item.domain,
+                        status=item.status,
+                    )
                 )
-                for item in sub_questions
-            )
             await session.commit()
 
     async def set_sub_question_status(
@@ -142,6 +147,31 @@ class SqlResearchStore:
             await session.commit()
             return str(created.id), True
 
+    async def list_passages(
+        self, *, run_id: str, source_id: str, sub_question_id: str
+    ) -> list[PassageItem]:
+        async with self._session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(Passage)
+                    .where(
+                        Passage.source_id == _uuid(source_id),
+                        Passage.sub_question_id == _uuid(sub_question_id),
+                    )
+                    .order_by(Passage.chunk_index)
+                )
+            ).scalars().all()
+            return [
+                PassageItem(
+                    id=str(row.id),
+                    source_id=str(row.source_id),
+                    sub_question_id=str(row.sub_question_id) if row.sub_question_id else None,
+                    text=row.text,
+                    chunk_index=row.chunk_index,
+                )
+                for row in rows
+            ]
+
     async def save_passages(
         self,
         *,
@@ -174,7 +204,7 @@ class SqlResearchStore:
             await session.commit()
 
     async def save_claims(self, *, run_id: str, claims: list[ClaimItem]) -> None:
-        """All claims and their evidence links in one transaction."""
+        """All claims and their evidence links in one transaction; existing IDs are replaced."""
         if not claims:
             return
         run_uuid = _uuid(run_id)
@@ -182,8 +212,14 @@ class SqlResearchStore:
             for claim in claims:
                 if not claim.evidence:
                     raise ValueError(f"claim {claim.id!r} has no evidence")
+            await session.execute(
+                delete(ClaimEvidence).where(
+                    ClaimEvidence.claim_id.in_([_uuid(claim.id) for claim in claims])
+                )
+            )
+            for claim in claims:
                 claim_uuid = _uuid(claim.id)
-                session.add(
+                await session.merge(
                     Claim(
                         id=claim_uuid,
                         run_id=run_uuid,
@@ -212,17 +248,25 @@ class SqlResearchStore:
     async def save_contradictions(
         self, *, run_id: str, contradictions: list[ContradictionItem]
     ) -> None:
-        """All contradictions and their claim links in one transaction."""
+        """All contradictions and their claim links in one transaction; existing IDs are replaced."""
         if not contradictions:
             return
         run_uuid = _uuid(run_id)
         async with self._session_factory() as session:
             for item in contradictions:
-                claim_ids = list(dict.fromkeys(item.claim_ids))
-                if len(claim_ids) < 2:
+                if len(set(item.claim_ids)) < 2:
                     raise ValueError(f"contradiction {item.id!r} needs two claims")
+            await session.execute(
+                delete(ContradictionClaim).where(
+                    ContradictionClaim.contradiction_id.in_(
+                        [_uuid(item.id) for item in contradictions]
+                    )
+                )
+            )
+            for item in contradictions:
+                claim_ids = list(dict.fromkeys(item.claim_ids))
                 contradiction_uuid = _uuid(item.id)
-                session.add(
+                await session.merge(
                     Contradiction(
                         id=contradiction_uuid,
                         run_id=run_uuid,
@@ -241,15 +285,23 @@ class SqlResearchStore:
             await session.commit()
 
     async def save_report(self, *, run_id: str, report: ResearchReport, markdown: str) -> str:
+        run_uuid = _uuid(run_id)
         async with self._session_factory() as session:
+            latest = (
+                await session.execute(
+                    select(func.coalesce(func.max(Report.version), 0)).where(
+                        Report.run_id == run_uuid
+                    )
+                )
+            ).scalar_one()
             row = await ReportRepository(session).create(
-                run_id=_uuid(run_id),
+                run_id=run_uuid,
                 content=report.model_dump(mode="json"),
                 markdown=markdown,
                 # The column is NOT NULL; quick-mode reports have no confidence
                 # (null in the content JSON), so 0.0 is stored for them.
                 overall_confidence=report.overall_confidence or 0.0,
-                version=1,
+                version=int(latest) + 1,
             )
             await session.commit()
             return str(row.id)

@@ -32,7 +32,11 @@ from app.core.config import Settings
 from app.models.evidence import Passage, Source
 from app.models.research import LLMUsage, Report, ResearchRun, RunEvent, SubQuestion
 from app.services.agent_runtime import build_agent_config
-from app.services.research_runner import execute_research, settings_for_run
+from app.services.research_runner import (
+    execute_research,
+    execute_run,
+    settings_for_run,
+)
 from app.services.research_store import SqlResearchStore
 
 QUESTION = "RAG versus fine-tuning"
@@ -319,3 +323,53 @@ class TestRunOptions:
         async with factory() as session:
             run = (await session.execute(select(ResearchRun))).scalars().one()
         assert run.options == {"max_sources": 1}
+
+
+class TestM8:
+    async def test_a_script_run_holds_a_lease_and_leaves_no_checkpoints(
+        self, factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        from app.models.checkpoints import GraphCheckpoint
+
+        cfg = settings()
+        outcome = await execute_research(
+            QUESTION, settings=cfg, session_factory=factory, runtime_kwargs=runtime_kwargs(cfg, make_web())
+        )
+
+        async with factory() as session:
+            run = (await session.execute(select(ResearchRun))).scalars().one()
+            checkpoints = (await session.execute(select(GraphCheckpoint))).scalars().all()
+        assert run.status == "completed" and run.attempts == 1
+        assert run.worker_id is not None and run.worker_id.startswith("script:")
+        assert run.lease_expires_at is None
+        assert checkpoints == []
+        assert outcome.persisted
+
+    async def test_a_resumed_run_counts_what_earlier_attempts_spent(
+        self, factory: async_sessionmaker[AsyncSession]
+    ) -> None:
+        async with factory() as session:
+            run = ResearchRun(question=QUESTION, status="running")
+            session.add(run)
+            await session.flush()
+            session.add(
+                LLMUsage(run_id=run.id, agent="planner", model="m", tokens_in=900, tokens_out=100)
+            )
+            await session.commit()
+            run_id = str(run.id)
+        # A budget the first attempt already spent: research is skipped.
+        cfg = settings(max_tokens_per_run=1000)
+
+        outcome = await execute_run(
+            run_id,
+            question=QUESTION,
+            mode="quick",
+            settings=cfg,
+            session_factory=factory,
+            runtime_kwargs=runtime_kwargs(cfg, make_web()),
+            resume=True,
+        )
+
+        assert outcome.usage["tokens_used"] >= 1000
+        assert outcome.usage["calls"] >= 1
+        assert outcome.stored_source_ids == set()

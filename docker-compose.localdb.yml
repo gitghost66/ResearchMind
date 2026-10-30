@@ -1,0 +1,42 @@
+# Adds a bundled PostgreSQL + pgvector to docker-compose.prod.yml, so the
+# production layout runs with no database of your own:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.localdb.yml up -d --build
+#
+# It replaces DATABASE_URL (and DATABASE_LISTEN_URL) from backend/.env for
+# every service. Data lives in the `pgdata` volume; `down -v` deletes it.
+
+x-local-db: &local-db
+  DATABASE_URL: postgresql+asyncpg://researchmind:researchmind@postgres:5432/researchmind
+  DATABASE_LISTEN_URL: ""
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: researchmind
+      POSTGRES_PASSWORD: researchmind
+      POSTGRES_DB: researchmind
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U researchmind -d researchmind"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    environment: *local-db
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    environment: *local-db
+
+  worker:
+    environment: *local-db
+
+volumes:
+  pgdata:

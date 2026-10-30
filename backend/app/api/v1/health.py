@@ -32,8 +32,10 @@ async def ready(request: Request) -> dict[str, Any]:
     Readiness probe: is the database reachable, and is an LLM key configured?
 
     ``database`` is ``ok`` or ``error`` once the app has a database,
-    ``not_configured`` without ``DATABASE_URL``. ``runs`` counts this process's
-    background runs.
+    ``not_configured`` without ``DATABASE_URL``. ``runs`` counts queued and
+    running runs across all workers; ``worker`` describes the one in this
+    process, if any, and ``listening`` whether PostgreSQL notifications arrive
+    (without them, streams and workers poll).
     """
     settings = app_settings(request)
     services = getattr(request.app.state, "services", None)
@@ -44,10 +46,19 @@ async def ready(request: Request) -> dict[str, Any]:
         checks["database"] = "configured" if settings.database_url else "not_configured"
     else:
         checks["database"] = await _ping(services.session_factory)
-        result["runs"] = {
-            "running": services.runner.running_count,
-            "pending": services.runner.pending_count,
-        }
+        if checks["database"] == "ok":
+            try:
+                result["runs"] = await services.queue.counts()
+            except Exception:  # noqa: BLE001 - the ping already reported the database
+                logger.warning("Could not count runs", exc_info=True)
+        if services.worker is not None:
+            result["worker"] = {
+                "id": services.worker.worker_id,
+                "running": services.worker.running_count,
+                "capacity": services.worker.capacity,
+            }
+        if services.listener is not None:
+            result["listening"] = services.listener.listening.is_set()
 
     checks["gemini"] = "not_configured" if not settings.gemini_api_key else "configured"
 

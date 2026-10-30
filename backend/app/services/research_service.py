@@ -1,13 +1,13 @@
 """
-Research runs as the API sees them.
+Research runs as the API and the workers see them.
 
-* :class:`ResearchJobs` — the background job for one API-created run: mark it
-  running, execute the graph, record the outcome. Handed to the
-  :class:`~app.workers.job_runner.JobRunner`.
-* :class:`ResearchService` — what the routes call: create, read, cancel, and
-  delete runs, and read their report, evidence graph, sources, and usage.
-* :func:`recover_orphaned_runs` — the startup sweep: runs a previous process
-  left ``queued``/``running`` are marked failed, so none stays stuck.
+* :class:`ResearchJobs` — executes one claimed run: read it, close the steps
+  an interruption left open (on a resume), run the graph from its last
+  checkpoint, and record the outcome as its owner. Used by
+  :class:`~app.workers.research_worker.RunWorker`.
+* :class:`ResearchService` — what the routes call: create, read, cancel,
+  resume, and delete runs, and read their report, evidence graph, sources, and
+  usage. Creating a run only queues it; a worker claims it from the database.
 
 No prompt text or agent logic here (AGENTS.md rule 2): the graph runs inside
 ``execute_run``; this module only owns the run's lifecycle and its reads.
@@ -20,7 +20,7 @@ import json
 import logging
 import uuid
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Protocol
 
 from researchmind_agents.graph import pipeline_steps
 from researchmind_agents.state import SUPPORTED_MODES
@@ -52,31 +52,36 @@ from app.schemas.research import (
     UsageResponse,
 )
 from app.services.agent_runtime import build_agent_config
+from app.services.checkpointer import SqlCheckpointSaver
 from app.services.evidence_graph import build_evidence_graph, load_graph_data
 from app.services.research_runner import execute_run
 from app.services.run_events import (
     ACTIVE_STATUSES,
-    INTERRUPTED_ERROR,
     RUNNER_AGENT,
     TERMINAL_STATUSES,
     RunEventRecorder,
 )
-from app.workers.job_runner import SHUTDOWN, JobRunner, QueueFullError
+from app.services.run_queue import Claim, RunQueue
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "INTERRUPTED_STEP",
+    "LocalWorker",
     "ResearchJobs",
     "ResearchService",
     "RuntimeKwargsFactory",
     "build_steps",
-    "recover_orphaned_runs",
 ]
 
 # Builds per-run overrides for build_agent_runtime (tests inject fakes here).
 RuntimeKwargsFactory = Callable[[Settings], Mapping[str, Any]]
 
 _STEP_EVENTS = ("agent_started", "agent_finished", "error")
+
+# Payload status of the agent_finished events that close steps an
+# interruption cut short.
+INTERRUPTED_STEP = "interrupted"
 
 # Recording a run's outcome is retried this often, waiting 0.5s, 1s, ... between.
 _FINISH_ATTEMPTS = 3
@@ -90,13 +95,21 @@ def _uuid(value: str | uuid.UUID) -> uuid.UUID:
     return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
 
 
+class LocalWorker(Protocol):
+    """The worker running in this process, if any (it can stop a run at once)."""
+
+    def is_active(self, run_id: str) -> bool: ...
+
+    async def stop(self, run_id: str, *, wait: float) -> bool: ...
+
+
 # ---------------------------------------------------------------------------
-# Background job
+# Jobs
 # ---------------------------------------------------------------------------
 
 
 class ResearchJobs:
-    """Executes API-created runs; one instance serves every run."""
+    """Executes claimed runs; one instance serves every run of a worker."""
 
     def __init__(
         self,
@@ -110,89 +123,106 @@ class ResearchJobs:
         self._session_factory = session_factory
         self._recorder = recorder
         self._runtime_kwargs = runtime_kwargs
+        self.checkpoints = SqlCheckpointSaver(session_factory)
 
-    async def run(self, run_id: str) -> None:
+    async def execute(self, claim: Claim) -> tuple[str, str | None]:
         """
-        The job: queued -> running -> completed | failed.
+        Run the graph for a claimed run; returns the status to record
+        (``completed`` or ``failed``) and its error.
 
-        Any error, including one reading the run or marking it running, ends
-        the run as failed, so a database hiccup cannot leave it active.
+        Any error, including one reading the run, ends it as failed, with its
+        checkpoints kept so it can be resumed. Cancellation propagates.
         """
+        run_id = claim.run_id
         try:
-            await self._run(run_id)
+            async with self._session_factory() as session:
+                run = await session.get(ResearchRun, _uuid(run_id))
+                if run is None:
+                    return "completed", None  # deleted meanwhile; finishing is a no-op
+                question, mode = run.question, run.mode
+                user_context, options = dict(run.user_context or {}), dict(run.options or {})
+
+            if claim.resumed:
+                await self._close_interrupted_steps(run_id)
+            await execute_run(
+                run_id,
+                question=question,
+                mode=mode,
+                user_context=user_context,
+                options=options,
+                settings=self._settings,
+                session_factory=self._session_factory,
+                recorder=self._recorder,
+                runtime_kwargs=(
+                    self._runtime_kwargs(self._settings) if self._runtime_kwargs else None
+                ),
+                checkpointer=self.checkpoints,
+                resume=claim.resumed,
+            )
         except asyncio.CancelledError:
-            raise  # the runner records it through interrupted()
+            raise
         except Exception as exc:  # noqa: BLE001 - recorded on the run
             logger.warning("Run %s failed: %s", run_id, exc, extra={"run_id": run_id})
-            await self._finish(run_id, "failed", error=f"{type(exc).__name__}: {exc}")
-            return
-        await self._finish(run_id, "completed")
+            return "failed", f"{type(exc).__name__}: {exc}"
+        return "completed", None
 
-    async def _run(self, run_id: str) -> None:
-        async with self._session_factory() as session:
-            run = await session.get(ResearchRun, _uuid(run_id))
-            if run is None:
-                return  # deleted while queued
-            question, mode = run.question, run.mode
-            user_context, options = dict(run.user_context or {}), dict(run.options or {})
-
-        # Fails if the run was cancelled while it waited for a slot; the
-        # "completed" in run() is then a no-op, since a terminal status is final.
-        if not await self._recorder.transition(run_id, "running", from_statuses={"queued"}):
-            return
-
-        await execute_run(
-            run_id,
-            question=question,
-            mode=mode,
-            user_context=user_context,
-            options=options,
-            settings=self._settings,
-            session_factory=self._session_factory,
-            recorder=self._recorder,
-            runtime_kwargs=(self._runtime_kwargs(self._settings) if self._runtime_kwargs else None),
-        )
-
-    async def interrupted(self, run_id: str, reason: str) -> None:
-        """Record a cancelled job: by a client, or by the server stopping."""
-        if reason == SHUTDOWN:
-            await self._finish(run_id, "failed", error=INTERRUPTED_ERROR)
-        else:
-            await self._finish(run_id, "cancelled")
-
-    async def _finish(self, run_id: str, status: str, *, error: str | None = None) -> None:
-        """Record the outcome, retrying briefly: a run left active never ends its streams."""
+    async def finish(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+        owner: str | None = None,
+    ) -> bool:
+        """
+        Record the outcome as *owner*, retrying briefly: a run left active
+        never ends its streams (its lease lapsing is the backstop).
+        """
         for attempt in range(1, _FINISH_ATTEMPTS + 1):
             try:
-                await self._recorder.transition(run_id, status, error=error)
-                return
-            except Exception as exc:  # noqa: BLE001 - the startup sweep is the backstop
+                return await self._recorder.transition(
+                    run_id, status, error=error, from_statuses={"running"}, owner=owner
+                )
+            except Exception as exc:  # noqa: BLE001 - the lease is the backstop
                 if attempt == _FINISH_ATTEMPTS:
                     logger.error("Failed to mark run %s as %s: %s", run_id, status, exc)
-                    return
+                    return False
                 await asyncio.sleep(_FINISH_RETRY_DELAY * attempt)
+        return False
 
+    async def drop_checkpoints(self, run_id: str) -> None:
+        try:
+            await self.checkpoints.adelete_thread(run_id)
+        except Exception as exc:  # noqa: BLE001 - only space is lost
+            logger.warning("Could not delete checkpoints of run %s: %s", run_id, exc)
 
-async def recover_orphaned_runs(
-    session_factory: async_sessionmaker[AsyncSession],
-    recorder: RunEventRecorder,
-) -> list[str]:
-    """
-    Mark runs left ``queued`` or ``running`` by a previous process as failed.
-
-    Call at startup, before accepting runs: this process has no task for any
-    of them, so none can finish. Assumes one API process (see JobRunner).
-    """
-    async with session_factory() as session:
-        result = await session.execute(
-            select(ResearchRun.id).where(ResearchRun.status.in_(list(ACTIVE_STATUSES)))
-        )
-        orphans = [str(run_id) for run_id in result.scalars().all()]
-    for run_id in orphans:
-        await recorder.transition(run_id, "failed", error=INTERRUPTED_ERROR)
-    if orphans:
-        logger.warning("Marked %d interrupted run(s) as failed", len(orphans))
-    return orphans
+    async def _close_interrupted_steps(self, run_id: str) -> None:
+        """
+        Close the steps the interruption left open, so progress counts stay
+        balanced: one ``agent_finished`` (status ``interrupted``) per
+        ``agent_started`` that never finished. The resumed run then starts
+        those steps again.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(RunEvent.agent, RunEvent.type, func.count())
+                .where(
+                    RunEvent.run_id == _uuid(run_id),
+                    RunEvent.type.in_(("agent_started", "agent_finished")),
+                )
+                .group_by(RunEvent.agent, RunEvent.type)
+            )
+            counts: dict[str, dict[str, int]] = {}
+            for agent, event_type, count in rows.all():
+                counts.setdefault(agent, {})[event_type] = int(count)
+        for agent, c in counts.items():
+            for _ in range(c.get("agent_started", 0) - c.get("agent_finished", 0)):
+                await self._recorder.record(
+                    run_id=run_id,
+                    agent=agent,
+                    event_type="agent_finished",
+                    payload={"status": INTERRUPTED_STEP},
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -258,12 +288,15 @@ class ResearchService:
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
         recorder: RunEventRecorder,
-        runner: JobRunner,
+        queue: RunQueue,
+        worker: LocalWorker | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.recorder = recorder
-        self.runner = runner
+        self.queue = queue
+        self.worker = worker
+        self.checkpoints = SqlCheckpointSaver(session_factory)
 
     # -- create -----------------------------------------------------------
 
@@ -323,22 +356,23 @@ class ResearchService:
         return question, mode, user_context, options
 
     async def create(self, body: ResearchCreate) -> RunCreated:
+        """Queue a run; a worker claims it (one in this process, if enabled, at once)."""
         question, mode, user_context, options = self.validate(body)
-        if not self.runner.accepting:
-            raise _busy()
-
+        await self._check_capacity()
         run_id = await self.recorder.create_run(
             question=question, mode=mode, user_context=user_context, options=options
         )
-        try:
-            self.runner.submit(run_id)
-        except QueueFullError:
-            # Filled up while the row was written: record why, then refuse.
-            await self.recorder.transition(
-                run_id, "failed", error="Rejected: too many runs queued", from_statuses={"queued"}
-            )
-            raise _busy() from None
         return RunCreated(run_id=run_id, status="queued", links=RunLinks.for_run(run_id))
+
+    async def _check_capacity(self) -> None:
+        """
+        503 when ``MAX_PENDING_RUNS`` runs are queued or running. Two requests
+        racing can each see one free place, so the cap can be passed by a run
+        or two; it bounds the queue, it does not meter it.
+        """
+        counts = await self.queue.counts()
+        if counts["queued"] + counts["running"] >= max(1, self.settings.max_pending_runs):
+            raise _busy()
 
     # -- read -------------------------------------------------------------
 
@@ -430,6 +464,7 @@ class ResearchService:
             options=dict(run.options or {}),
             plan=dict(run.plan or {}),
             iteration=run.iteration,
+            attempts=run.attempts,
             sub_questions=[
                 SubQuestionOut(id=str(sq.id), text=sq.text, domain=sq.domain, status=sq.status)
                 for sq in sub_questions
@@ -548,6 +583,10 @@ class ResearchService:
     # -- control ----------------------------------------------------------
 
     async def cancel(self, run_id: uuid.UUID) -> CancelResponse:
+        """
+        Mark the run cancelled. Its worker, in whatever process, is notified
+        and stops; one in this process is waited for (``CANCEL_WAIT_SECONDS``).
+        """
         key = str(run_id)
         async with self.session_factory() as session:
             run = await self.get(session, run_id)
@@ -556,9 +595,9 @@ class ResearchService:
                     409, "run_not_active", f"The run is already {run.status}", {"status": run.status}
                 )
 
-        if not await self.runner.cancel(key, wait=self.settings.cancel_wait_seconds):
-            # No task in this process (e.g. queued by a crashed one): settle it here.
-            await self.recorder.transition(key, "cancelled")
+        await self.recorder.transition(key, "cancelled")
+        if self.worker is not None:
+            await self.worker.stop(key, wait=self.settings.cancel_wait_seconds)
 
         async with self.session_factory() as session:
             run = await self.get(session, run_id)
@@ -569,15 +608,47 @@ class ResearchService:
             )
         return CancelResponse(run_id=key, status=run.status)  # type: ignore[arg-type]
 
+    async def resume(self, run_id: uuid.UUID) -> RunCreated:
+        """
+        Queue a failed run again. A worker resumes it from its last
+        checkpoint: steps that finished are not run again, and its budget
+        counts what earlier attempts spent.
+        """
+        key = str(run_id)
+        async with self.session_factory() as session:
+            run = await self.get(session, run_id)
+        if run.status != "failed":
+            raise ApiError(
+                409,
+                "run_not_resumable",
+                f"Only a failed run can be resumed; this one is {run.status}",
+                {"status": run.status},
+            )
+        await self._check_capacity()
+        if not await self.queue.requeue_failed(key):
+            async with self.session_factory() as session:
+                run = await self.get(session, run_id)
+            raise ApiError(
+                409,
+                "run_not_resumable",
+                f"Only a failed run can be resumed; this one is {run.status}",
+                {"status": run.status},
+            )
+        return RunCreated(run_id=key, status="queued", links=RunLinks.for_run(key))
+
     async def delete(self, run_id: uuid.UUID) -> None:
         key = str(run_id)
         async with self.session_factory() as session:
             await self.get(session, run_id)
-        await self.runner.cancel(key, wait=self.settings.cancel_wait_seconds)
+        # Cancelling first tells the run's worker, wherever it is, to stop.
+        await self.recorder.transition(key, "cancelled")
+        if self.worker is not None:
+            await self.worker.stop(key, wait=self.settings.cancel_wait_seconds)
         async with self.session_factory() as session:
             # Foreign keys cascade to every child table (migration 0001).
             await session.execute(delete(ResearchRun).where(ResearchRun.id == run_id))
             await session.commit()
+        await self.checkpoints.adelete_thread(key)
         self.recorder.notifier.notify(key)  # open streams notice and close
 
 

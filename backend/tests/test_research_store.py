@@ -546,3 +546,127 @@ class TestContradictions(_ClaimRows):
             await session.commit()
         assert await all_rows(factory, Contradiction) == []
         assert await all_rows(factory, ContradictionClaim) == []
+
+
+# ---------------------------------------------------------------------------
+# M8: a step re-run after a resume replaces its rows
+# ---------------------------------------------------------------------------
+
+
+class TestResumeIdempotency:
+    async def test_saving_a_plan_again_replaces_its_sub_questions(
+        self, store: SqlResearchStore, factory, run_id: str  # type: ignore[no-untyped-def]
+    ) -> None:
+        item = sub_question("First wording?")
+        await store.save_plan(run_id=run_id, plan={"v": 1}, sub_questions=[item])
+        reworded = item.model_copy(update={"text": "Second wording?"})
+
+        await store.save_plan(run_id=run_id, plan={"v": 2}, sub_questions=[reworded])
+
+        rows = await all_rows(factory, SubQuestion)
+        assert [(str(r.id), r.text) for r in rows] == [(item.id, "Second wording?")]
+
+    async def test_saving_claims_again_replaces_them_and_their_links(
+        self, store: SqlResearchStore, factory, run_id: str  # type: ignore[no-untyped-def]
+    ) -> None:
+        sq = sub_question()
+        await store.save_plan(run_id=run_id, plan={}, sub_questions=[sq])
+        source_id, _ = await store.save_source(run_id=run_id, source=source())
+        passages = [
+            PassageItem(id=str(uuid.uuid4()), source_id=source_id, sub_question_id=sq.id, text=t)
+            for t in ("one", "two")
+        ]
+        await store.save_passages(
+            run_id=run_id, passages=passages, embeddings=[None, None], embedding_model="m"
+        )
+        claim = ClaimItem(
+            id=str(uuid.uuid4()),
+            text="RAG is cheap.",
+            sub_question_id=sq.id,
+            passage_ids=[passages[0].id],
+            evidence=[EvidenceItem(passage_id=passages[0].id, source_id=source_id)],
+            verdict="weak",
+            confidence=0.3,
+        )
+        await store.save_claims(run_id=run_id, claims=[claim])
+
+        rechecked = claim.model_copy(
+            update={
+                "verdict": "supported",
+                "confidence": 0.8,
+                "evidence": [EvidenceItem(passage_id=passages[1].id, source_id=source_id)],
+            }
+        )
+        await store.save_claims(run_id=run_id, claims=[rechecked])
+
+        [row] = await all_rows(factory, Claim)
+        assert (row.verdict, row.confidence) == ("supported", 0.8)
+        links = await all_rows(factory, ClaimEvidence)
+        assert [str(link.passage_id) for link in links] == [passages[1].id]
+
+    async def test_saving_a_contradiction_again_replaces_it(
+        self, store: SqlResearchStore, factory, run_id: str  # type: ignore[no-untyped-def]
+    ) -> None:
+        sq = sub_question()
+        await store.save_plan(run_id=run_id, plan={}, sub_questions=[sq])
+        source_id, _ = await store.save_source(run_id=run_id, source=source())
+        passage = PassageItem(id=str(uuid.uuid4()), source_id=source_id, sub_question_id=sq.id, text="t")
+        await store.save_passages(run_id=run_id, passages=[passage], embeddings=[None], embedding_model="m")
+        claims = [
+            ClaimItem(
+                id=str(uuid.uuid4()),
+                text=text,
+                sub_question_id=sq.id,
+                passage_ids=[passage.id],
+                evidence=[EvidenceItem(passage_id=passage.id, source_id=source_id)],
+            )
+            for text in ("COP 3.", "COP 2.")
+        ]
+        await store.save_claims(run_id=run_id, claims=claims)
+        item = ContradictionItem(
+            id=str(uuid.uuid4()),
+            claim_ids=[c.id for c in claims],
+            explanation="Different tests.",
+            likely_cause="conditions",
+        )
+        await store.save_contradictions(run_id=run_id, contradictions=[item])
+
+        await store.save_contradictions(
+            run_id=run_id,
+            contradictions=[item.model_copy(update={"explanation": "Different temperatures."})],
+        )
+
+        [row] = await all_rows(factory, Contradiction)
+        assert row.explanation == "Different temperatures."
+        assert len(await all_rows(factory, ContradictionClaim)) == 2
+
+    async def test_a_second_report_is_the_next_version(
+        self, store: SqlResearchStore, factory, run_id: str  # type: ignore[no-untyped-def]
+    ) -> None:
+        report = ResearchReport(title="T", question="Q", mode="quick")
+        await store.save_report(run_id=run_id, report=report, markdown="first")
+        await store.save_report(run_id=run_id, report=report, markdown="second")
+
+        rows = sorted(await all_rows(factory, Report), key=lambda r: r.version)
+        assert [(r.version, r.markdown) for r in rows] == [(1, "first"), (2, "second")]
+
+    async def test_list_passages_returns_one_sub_questions_chunks_in_order(
+        self, store: SqlResearchStore, run_id: str
+    ) -> None:
+        first, second = sub_question("A?"), sub_question("B?")
+        await store.save_plan(run_id=run_id, plan={}, sub_questions=[first, second])
+        source_id, _ = await store.save_source(run_id=run_id, source=source())
+        mine = [
+            PassageItem(id=str(uuid.uuid4()), source_id=source_id, sub_question_id=first.id,
+                        text=f"chunk {i}", chunk_index=i)
+            for i in (1, 0)
+        ]
+        other = PassageItem(id=str(uuid.uuid4()), source_id=source_id, sub_question_id=second.id, text="x")
+        await store.save_passages(
+            run_id=run_id, passages=[*mine, other], embeddings=[None] * 3, embedding_model="m"
+        )
+
+        found = await store.list_passages(run_id=run_id, source_id=source_id, sub_question_id=first.id)
+
+        assert [p.text for p in found] == ["chunk 0", "chunk 1"]
+        assert all(p.sub_question_id == first.id for p in found)

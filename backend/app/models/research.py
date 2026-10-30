@@ -63,6 +63,16 @@ class ResearchRun(Base, TimestampMixin):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Worker lease (migration 0004). A running run belongs to worker_id until
+    # lease_expires_at; its worker renews the lease while it works. Once the
+    # lease lapses (the worker died), any worker may resume the run.
+    worker_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Times a worker started the run since it was last queued; an interrupted
+    # run is resumed until this reaches MAX_RUN_ATTEMPTS.
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # Relationships (cascade on delete)
     sub_questions: Mapped[list["SubQuestion"]] = relationship(

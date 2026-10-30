@@ -1,9 +1,10 @@
 """
-SQLAlchemy models for ResearchMind.
-All 11 tables required by PRD Section 7.
+SQLAlchemy models for ResearchMind: the 11 tables of PRD Section 7, plus the
+three LangGraph checkpoint tables that make runs resumable (M8).
 """
 
 from app.models.base import Base, TimestampMixin, UniversalUUID
+from app.models.checkpoints import GraphCheckpoint, GraphCheckpointBlob, GraphCheckpointWrite
 from app.models.claims import (
     Claim,
     ClaimEvidence,
@@ -34,4 +35,7 @@ __all__ = [
     "Report",
     "RunEvent",
     "LLMUsage",
+    "GraphCheckpoint",
+    "GraphCheckpointBlob",
+    "GraphCheckpointWrite",
 ]

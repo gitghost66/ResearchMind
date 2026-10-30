@@ -365,6 +365,31 @@ class TestDeduplication:
         assert len(store.passages) == len(update["passages"])
 
 
+    async def test_a_branch_re_run_after_a_resume_reuses_its_own_sources(self) -> None:
+        """M8: the branch's sources are stored but its state was lost; keep them."""
+        store = InMemoryResearchStore()
+        first = await run_node(build_fake_runtime(web=make_web(2), store=store))
+
+        again = await run_node(build_fake_runtime(web=make_web(2), store=store))
+
+        result = result_of(again)
+        assert result["sources"] == result_of(first)["sources"] == 2
+        assert result["duplicates"] == 0
+        assert [p["id"] for p in again["passages"]] == [p["id"] for p in first["passages"]]
+        assert len(store.sources) == 2
+
+    async def test_a_source_another_branch_stored_is_still_a_duplicate(self) -> None:
+        store = InMemoryResearchStore()
+        await run_node(build_fake_runtime(web=make_web(2), store=store))
+        other = SubQuestionItem(id="sq-2", text="What does RAG cost?", queries=["rag"])
+
+        update = await run_node(build_fake_runtime(web=make_web(2), store=store), other)
+
+        result = result_of(update)
+        assert (result["sources"], result["duplicates"]) == (0, 2)
+        assert update["passages"] == []
+
+
 # ===========================================================================
 # Degradation
 # ===========================================================================

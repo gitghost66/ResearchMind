@@ -86,6 +86,7 @@ __all__ = [
     "make_web_researcher_node",
     "make_technical_researcher_node",
     "make_market_researcher_node",
+    "fetch_candidates",
     "merge_candidates",
     "prefer_types",
     "score_source",
@@ -305,7 +306,7 @@ async def research_web(
         return
 
     ordered = await _choose(runtime, run_id, sub_question, candidates, log, outcome, profile)
-    fetched = await _fetch(runtime, ordered, outcome)
+    fetched = await fetch_candidates(runtime, ordered, outcome)
     pages = [
         PageToStore(
             url=page.final_url or candidate.url,
@@ -448,12 +449,16 @@ async def _choose(
     return chosen + [c for c in backups if c not in chosen]
 
 
-async def _fetch(
+async def fetch_candidates(
     runtime: AgentRuntime,
     ordered: list[Candidate],
     outcome: ResearchOutcome,
 ) -> list[tuple[Candidate, PageContent]]:
-    """Fetch until enough pages have usable text or the attempt cap is hit."""
+    """
+    Fetch until enough pages have usable text or the attempt cap is hit.
+
+    Also used by the single-agent RAG baseline (``evals/systems.py``).
+    """
     config = runtime.config.research
     want = max(1, config.pages_per_sub_question)
     max_attempts = max(want, config.max_fetch_attempts)
@@ -551,7 +556,18 @@ async def store_pages(
             if not created:
                 runtime.source_slots -= 1
         if not created:
-            outcome.duplicates += 1
+            known = {s.id for s in outcome.sources} | {s.id for s, _ in new_sources}
+            reused = (
+                []
+                if source_id in known
+                else await _earlier_passages(runtime, run_id, source_id, sub_question)
+            )
+            if reused:
+                # Stored by this branch before the run was interrupted.
+                outcome.sources.append(source.model_copy(update={"id": source_id}))
+                outcome.passages.extend(reused)
+            else:
+                outcome.duplicates += 1
             continue
 
         chunks = chunk_text(
@@ -614,6 +630,29 @@ async def store_pages(
             reliability_score=source.reliability_score,
             passages=len(passages),
         )
+
+
+async def _earlier_passages(
+    runtime: AgentRuntime,
+    run_id: str,
+    source_id: str,
+    sub_question: SubQuestionItem,
+) -> list[PassageItem]:
+    """
+    Passages this sub-question already stored for an existing source.
+
+    Empty for a true duplicate (another branch stored it). Non-empty when this
+    branch ran before a resume: its sources are then stored but missing from
+    the state, and are reused. (A page this call already stored under another
+    URL is ruled out by the caller.)
+    """
+    try:
+        return await runtime.store.list_passages(
+            run_id=run_id, source_id=source_id, sub_question_id=sub_question.id
+        )
+    except Exception as exc:  # noqa: BLE001 - treat it as a duplicate
+        logger.warning("Could not read passages of source %s: %s", source_id, exc)
+        return []
 
 
 def _parse_iso(value: str | None) -> datetime | None:

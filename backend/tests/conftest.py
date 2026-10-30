@@ -35,6 +35,7 @@ from app.main import app, create_app
 from app.models.base import Base
 from app.services.agent_runtime import build_agent_config
 from app.services.run_events import TERMINAL_STATUSES
+from app.workers.research_worker import RunWorker
 
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
 
@@ -102,8 +103,9 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
 
 
 # ---------------------------------------------------------------------------
-# API harness (M4): the real app, services, and job runner over a SQLite file,
-# with the agents' fakes standing in for the LLM, search, pages, and embeddings.
+# API harness (M4, M8): the real app, services, and in-process worker over a
+# SQLite file, with the agents' fakes standing in for the LLM, search, pages,
+# and embeddings.
 # ---------------------------------------------------------------------------
 
 API_QUESTION = "RAG versus fine-tuning"
@@ -128,7 +130,9 @@ def make_fake_web() -> FakeWeb:
 
 class GatedLLM(ScriptedLLM):
     """
-    Model calls wait for ``gate``; ``waiting`` is set when one starts.
+    Model calls wait for ``gate``; ``waiting`` is set when one starts. With
+    schema names in ``hold``, only those calls wait (e.g. ``ReportOutput``
+    holds a quick run at its synthesizer, after the planner and research).
 
     Clearing the gate before a run starts holds it at the planner's call: one
     task, no query open, so cancelling it there is clean. (Cancelling a run
@@ -136,14 +140,25 @@ class GatedLLM(ScriptedLLM):
     GC; asyncpg closes the socket instead, so Postgres is unaffected.)
     """
 
-    def __init__(self, *args: Any, gate: asyncio.Event, waiting: asyncio.Event, **kwargs: Any):
+    def __init__(
+        self,
+        *args: Any,
+        gate: asyncio.Event,
+        waiting: asyncio.Event,
+        hold: set[str] | None = None,
+        **kwargs: Any,
+    ):
         super().__init__(*args, **kwargs)
         self._gate = gate
         self._waiting = waiting
+        self._hold = hold if hold is not None else set()
 
     async def _complete(self, **kwargs: Any) -> Any:
-        self._waiting.set()
-        await self._gate.wait()
+        schema = kwargs.get("json_schema")
+        name = schema.__name__ if schema is not None else "text"
+        if not self._hold or name in self._hold:
+            self._waiting.set()
+            await self._gate.wait()
         return await super()._complete(**kwargs)
 
 
@@ -153,6 +168,7 @@ def make_test_settings(**overrides: Any) -> Settings:
         "database_url": "",
         "api_key": "",
         "sse_poll_interval_seconds": 0.2,
+        "worker_poll_seconds": 0.1,
         "cancel_wait_seconds": 5.0,
         "shutdown_grace_seconds": 5.0,
     }
@@ -168,13 +184,21 @@ class ApiHarness:
     settings: Settings
     engine: AsyncEngine
     web: FakeWeb
-    # Clear to hold the next run at its first model call (the planner's).
+    # Clear to hold the next run at its first model call (the planner's), or
+    # at the first call whose schema is in ``hold``.
     gate: asyncio.Event
     waiting: asyncio.Event
+    hold: set[str]
+    runtime_kwargs: Callable[[Settings], dict[str, Any]]
 
     @property
     def session_factory(self) -> async_sessionmaker[AsyncSession]:
         return self.services.session_factory
+
+    @property
+    def worker(self) -> RunWorker:
+        assert self.services.worker is not None, "this harness runs no worker"
+        return self.services.worker
 
     async def create(self, **body: Any) -> str:
         body.setdefault("question", API_QUESTION)
@@ -206,6 +230,35 @@ def _sqlite_wal(dbapi_connection, connection_record):  # type: ignore[no-untyped
     cursor.close()
 
 
+def make_runtime_kwargs(
+    web: FakeWeb, gate: asyncio.Event, waiting: asyncio.Event, hold: set[str] | None = None
+) -> Callable[[Settings], dict[str, Any]]:
+    """Fakes for every external service; model calls wait for *gate*."""
+
+    def runtime_kwargs(run_settings: Settings) -> dict[str, Any]:
+        config = build_agent_config(run_settings)
+
+        def llm_factory(llm_config: LLMConfig, sink: UsageSink | None) -> ScriptedLLM:
+            return GatedLLM(
+                dataclasses.replace(llm_config, base_delay=0.0, overload_delay=0.0),
+                sink,
+                gate=gate,
+                waiting=waiting,
+                hold=hold,
+            )
+
+        return {
+            "llm_factory": llm_factory,
+            "embeddings": fake_embedding_service(config.embedding),
+            "search": SearchTool(config.search, provider=FakeSearchProvider(web)),
+            "page_extract": FakePageExtract(web),
+            # Never reach arXiv or Semantic Scholar from tests.
+            "scholarly": fake_scholarly_tool(config),
+        }
+
+    return runtime_kwargs
+
+
 async def _build_harness(tmp_path: Any, index: int, **overrides: Any) -> ApiHarness:
     settings = make_test_settings(**overrides)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / f'api-{index}.db'}")
@@ -218,28 +271,12 @@ async def _build_harness(tmp_path: Any, index: int, **overrides: Any) -> ApiHarn
     gate = asyncio.Event()
     gate.set()
     waiting = asyncio.Event()
-
-    def runtime_kwargs(run_settings: Settings) -> dict[str, Any]:
-        config = build_agent_config(run_settings)
-
-        def llm_factory(llm_config: LLMConfig, sink: UsageSink | None) -> ScriptedLLM:
-            return GatedLLM(
-                dataclasses.replace(llm_config, base_delay=0.0, overload_delay=0.0),
-                sink,
-                gate=gate,
-                waiting=waiting,
-            )
-
-        return {
-            "llm_factory": llm_factory,
-            "embeddings": fake_embedding_service(config.embedding),
-            "search": SearchTool(config.search, provider=FakeSearchProvider(web)),
-            "page_extract": FakePageExtract(web),
-            # Never reach arXiv or Semantic Scholar from tests.
-            "scholarly": fake_scholarly_tool(config),
-        }
+    hold: set[str] = set()
+    runtime_kwargs = make_runtime_kwargs(web, gate, waiting, hold)
 
     services = build_services(settings, factory, runtime_kwargs=runtime_kwargs)
+    # ASGITransport sends no lifespan events, so start what the lifespan would.
+    await services.startup()
     app = create_app(settings=settings, services=services)
     client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
     return ApiHarness(
@@ -251,6 +288,8 @@ async def _build_harness(tmp_path: Any, index: int, **overrides: Any) -> ApiHarn
         web=web,
         gate=gate,
         waiting=waiting,
+        hold=hold,
+        runtime_kwargs=runtime_kwargs,
     )
 
 

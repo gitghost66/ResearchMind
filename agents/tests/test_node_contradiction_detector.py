@@ -35,6 +35,7 @@ from researchmind_agents.state import (
     SourceItem,
     SubQuestionItem,
     new_research_state,
+    stable_id,
 )
 from researchmind_agents.storage import InMemoryResearchStore
 from researchmind_agents.testing import ScriptedLLM, build_fake_runtime
@@ -263,6 +264,19 @@ class TestDetection:
         assert found["payload"]["contradiction_id"] == item.id
         assert found["payload"]["resolved"] is True
         assert [c["prompt_version"] for c in result["llm_calls"]] == [PROMPT_VERSION]
+
+    async def test_a_re_run_finds_the_same_contradiction_under_the_same_id(self) -> None:
+        """M8: after a resume the detector may run again; it must replace, not duplicate."""
+        runtime = build_fake_runtime(responses={"ContradictionOutput": responder(([LAB, FIELD], "date"))})
+        state = await seed(runtime, CONFLICT)
+        node = make_contradiction_detector_node(runtime)
+
+        [first] = (await node(state))["contradictions"]
+        [second] = (await node(state))["contradictions"]
+
+        assert first["id"] == second["id"]
+        assert first["id"] == stable_id(RUN, "contradiction", *sorted(first["claim_ids"]))
+        assert len(store_of(runtime).contradictions) == 1
 
     async def test_the_prompt_shows_what_explains_the_difference(self) -> None:
         runtime = build_fake_runtime()

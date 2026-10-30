@@ -183,3 +183,18 @@ class TestFromConfig:
         assert budget.max_cost_usd == 0.5
         assert budget.synthesis_reserve == 0.3
         assert budget.tokens_used == 0
+
+
+class TestSeed:
+    """M8: a resumed run's budget counts what earlier attempts spent."""
+
+    def test_seeded_usage_counts_toward_the_limits(self) -> None:
+        tracker = BudgetTracker(max_tokens=1000, synthesis_reserve=0.2)
+        tracker.seed(tokens=850, cost_usd=0.25, calls=4)
+        assert (tracker.tokens_used, tracker.cost_usd, tracker.calls) == (850, 0.25, 4)
+        assert tracker.research_exhausted and not tracker.exceeded
+
+    def test_negative_values_are_ignored(self) -> None:
+        tracker = BudgetTracker()
+        tracker.seed(tokens=-5, cost_usd=-1.0, calls=-2)
+        assert (tracker.tokens_used, tracker.cost_usd, tracker.calls) == (0, 0.0, 0)
