@@ -1,0 +1,18 @@
+# Only the two packages go into the image; secrets never do.
+**/.env
+**/.env.*
+!.env.example
+.git
+.venv
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+frontend
+agents/tests
+backend/tests
+agents/researchmind_agents/evals/results
+*.md
+!README.md

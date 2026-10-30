@@ -23,8 +23,9 @@
 | LLM (fallback) | Any OpenAI-compatible endpoint (OpenRouter / Groq / local) over `httpx` — satisfies the PRD's two-provider requirement with no extra dependency |
 | Embeddings | Gemini `gemini-embedding-001` at 768d (`output_dimensionality`) via `google-genai` — `text-embedding-004` was shut down 2026-01-14 |
 | Database | Supabase Cloud (PostgreSQL + pgvector) |
-| Realtime | SSE streamed from `run_events` by `seq` (replaces Redis pub/sub; in-process wake-ups, Postgres LISTEN/NOTIFY in M8) |
-| Background jobs | In-process asyncio tasks (`app/workers/job_runner.py`; no Redis/ARQ) — run the API as one worker |
+| Realtime | SSE streamed from `run_events` by `seq` (replaces Redis pub/sub); wake-ups across processes via Postgres `LISTEN/NOTIFY` (`app/services/pg_listener.py`), polling as the fallback |
+| Background jobs | Postgres as the queue (no Redis/ARQ): workers (`app/workers/research_worker.py`, or one inside the API) claim runs under a lease and resume them from LangGraph checkpoints stored by `app/services/checkpointer.py` |
+| Deployment | Multi-stage `backend/Dockerfile` (one image: API, worker, migrations), `docker-compose.prod.yml` + Nginx (`deploy/nginx/`), AWS guide in `docs/DEPLOY_AWS.md` |
 | Search | DuckDuckGo via `ddgs` (successor of `duckduckgo-search`, which stopped returning results), behind the `SearchProvider` interface |
 | Academic search | arXiv and Semantic Scholar APIs over `httpx` (stdlib XML/JSON parsing), behind the `ScholarlyProvider` interface |
 | Scoring | Deterministic formulas in `reliability.py`; domain types from the versioned `data/domains.json` (JSON, so no YAML dependency) |
@@ -39,6 +40,10 @@ researchmind/
 ├── AGENTS.md
 ├── .env.example
 ├── README.md
+├── docker-compose.yml          # development: one container, reload
+├── docker-compose.prod.yml     # Nginx + API processes + workers (+ docker-compose.localdb.yml)
+├── deploy/nginx/               # reverse proxy config
+├── docs/DEPLOY_AWS.md          # EC2 / ECS deployment
 ├── backend/
 │   ├── pyproject.toml
 │   ├── app/
@@ -47,8 +52,8 @@ researchmind/
 │   │   ├── api/v1/        # routers
 │   │   ├── models/        # SQLAlchemy models
 │   │   ├── schemas/       # Pydantic request/response
-│   │   ├── services/      # business logic
-│   │   ├── workers/       # background task runners
+│   │   ├── services/      # business logic, run queue, checkpointer, LISTEN bridge
+│   │   ├── workers/       # research worker (claims runs) and its task runner
 │   │   └── db/            # session, migrations (Alembic)
 │   └── tests/
 ├── agents/
@@ -67,7 +72,7 @@ researchmind/
 │   │   ├── llm/           # provider abstraction
 │   │   └── evals/         # evaluation harness
 │   └── tests/
-└── frontend/              # placeholder, built later
+└── frontend/              # React + Vite UI (npm; see frontend/README.md)
 ```
 
 ## Package boundary
@@ -76,7 +81,10 @@ The agents package must not import `app.*`, SQLAlchemy, or FastAPI. The two
 sides meet in exactly two places:
 
 - **Config** — `backend/app/services/agent_runtime.py` turns `Settings` into an
-  `AgentConfig` (a plain frozen dataclass) via `AgentConfig.from_mapping`.
+  `AgentConfig` (a plain frozen dataclass) via `AgentConfig.from_mapping`. The
+  eval CLI (`python -m researchmind_agents.evals`) reaches that same
+  `build_agent_config` through the `researchmind_agents.config` entry point
+  declared in `backend/pyproject.toml`, never through an import.
 - **Storage** — the backend injects three things, all built in
   `agent_runtime.py` and bundled into an `AgentRuntime`
   (`researchmind_agents/runtime.py`):

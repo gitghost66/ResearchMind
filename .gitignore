@@ -44,10 +44,18 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# Raw seed-eval output; summaries go in IMPLEMENTATION_PLAN.md
-agents/researchmind_agents/evals/results/
+# Raw eval output (seed and offline runs, per-sentence details) stays local.
+# Benchmark summaries (results.md, results.json, meta.json, spot_check.jsonl)
+# are committed (M7).
+agents/researchmind_agents/evals/results/*
+!agents/researchmind_agents/evals/results/benchmark-*/
+agents/researchmind_agents/evals/results/benchmark-*/details.jsonl
 
 # OS specific
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
