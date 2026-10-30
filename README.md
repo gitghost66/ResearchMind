@@ -2,6 +2,27 @@
 
 A multi-agent AI research system that decomposes complex questions, researches them in parallel with specialized agents, extracts and verifies claims, detects contradictions, and produces citation-backed reports with confidence scores.
 
+- **Four research modes** — `quick` (cited answer from web passages), `deep`,
+  `academic`, and `decision` (specialist researchers, fact-checked claims,
+  contradiction detection, gap-filling rounds, and a recommendation in
+  `decision`).
+- **Evidence you can follow** — every citation points to a stored source
+  passage; scores come from documented formulas, never from a model.
+- **Durable runs** — a REST + Server-Sent Events API, workers that resume a run
+  from its last checkpoint after a crash, and a web UI to follow it all live.
+- **Measured** — a 40-question benchmark against a closed-book LLM and a
+  single-agent RAG baseline.
+
+**Status:** every milestone (M0–M8) is built and tested offline. Still to do:
+the live evaluation runs (M3's seed eval, M5–M7) and an AWS deployment
+([Milestones](#milestones)).
+
+**Contents:** [Quick Start](#quick-start) ·
+[LLM providers](#llm-providers) · [Research graph](#research-graph) ·
+[Research API](#research-api-m4-m6-m8) · [Architecture](#architecture) ·
+[Deployment](#deployment) · [Project Structure](#project-structure) ·
+[Milestones](#milestones)
+
 ## Quick Start
 
 ### With Docker (fresh clone, nothing else to install)
@@ -25,7 +46,8 @@ curl http://localhost:8080/ready
 Port 8080 taken? Run with `HTTP_PORT=8090` (any free port) in front of the
 command.
 
-Then try the [API](#research-api-m4-m6-m8) on `http://localhost:8080`. Check
+Then try the [API](#research-api-m4-m6-m8) on `http://localhost:8080`, or
+point the [web UI](#the-web-ui) at it. Check
 the whole deployment with the smoke tests (they start real runs, so they spend
 a few model calls):
 
@@ -49,12 +71,35 @@ service applies the migrations either way. Deploying to AWS:
 
 ### The web UI
 
-A dark-theme React app in `frontend/` (see [frontend/README.md](frontend/README.md)):
-start runs, follow them live, read reports, explore the evidence graph.
+A dark-theme React + TypeScript app in `frontend/` (see
+[frontend/README.md](frontend/README.md)): start runs and list past ones,
+follow a run live, read the report, explore the evidence graph, and check
+sources and usage. Needs Node.js 18+.
 
 ```bash
-cd backend && uvicorn app.main:app --port 8000 --timeout-graceful-shutdown 5   # the API
-cd frontend && npm install && npm run dev                                     # http://localhost:5173
+cd frontend && npm install
+
+# Against the Docker stack above
+API_TARGET=http://localhost:8080 npm run dev     # http://localhost:5173
+
+# Or against a local API (see below) on port 8000, the default
+npm run dev
+```
+
+The dev server proxies the API, so no CORS setup is needed. On Windows
+PowerShell, put `API_TARGET=http://localhost:8080` in `frontend/.env.local`
+instead of in front of the command. If the API has an `API_KEY`, paste it under
+**Settings** (top right); the browser keeps it and sends it as `X-API-Key`.
+
+### With Docker, for development
+
+`docker-compose.yml` runs one container with the API and a research worker,
+reloading on code changes. It has no database of its own, so set `DATABASE_URL`
+(Supabase, or any PostgreSQL with pgvector) in `backend/.env` first.
+
+```bash
+docker compose run --rm api alembic upgrade head   # once, and after new migrations
+docker compose up --build                          # http://localhost:8000
 ```
 
 ### Without Docker (development)
@@ -195,6 +240,9 @@ Check the judge by hand: set `human_stance` (`supports`, `contradicts`, or
 
 ```bash
 python -m researchmind_agents.evals agreement agents/researchmind_agents/evals/results/<run>
+
+# Rebuild results.md and results.json from a results directory
+python -m researchmind_agents.evals table agents/researchmind_agents/evals/results/<run>
 ```
 
 The CLI gets its settings (keys, models) from `backend/.env` through an entry
@@ -226,6 +274,9 @@ DATABASE_URL=postgresql+asyncpg://... pytest -m integration
 ```bash
 ruff check .
 mypy backend/app agents/researchmind_agents
+
+# The web UI
+cd frontend && npm run typecheck && npm run build
 ```
 
 ## LLM providers
@@ -506,9 +557,43 @@ with `run_id` and `worker_id` on every line written inside a run.
 
 ## Project Structure
 
-- `backend/` — FastAPI REST API, database models, services
-- `agents/` — LangGraph agent workflow, LLM wrapper, tools, prompts
-- `frontend/` — React + Vite web UI (dark theme), talking to the API
+```
+├── backend/                    # HTTP, database, and process lifecycle; no prompts
+│   ├── app/
+│   │   ├── api/v1/             # health and research routers
+│   │   ├── core/               # Settings, logging, security, dependencies
+│   │   ├── models/ schemas/    # SQLAlchemy tables, Pydantic request/response shapes
+│   │   ├── repositories/       # async CRUD and pgvector search
+│   │   ├── services/           # run queue, checkpointer, event stream, LISTEN bridge,
+│   │   │                       #   agent runtime (Settings → AgentConfig), SQL store
+│   │   └── workers/            # research worker (claims runs) and its job runner
+│   ├── alembic/versions/       # migrations 0001–0004
+│   ├── scripts/                # run_mvp.py, eval_*.py, smoke_test.py
+│   ├── tests/
+│   └── Dockerfile              # one image: API, worker, migrations
+├── agents/                     # the research graph; never imports the backend
+│   ├── researchmind_agents/
+│   │   ├── graph.py modes.py state.py
+│   │   ├── nodes/              # planner, researchers, claims, fact checker,
+│   │   │                       #   contradictions, sufficiency, synthesizer
+│   │   ├── prompts/            # one file per agent
+│   │   ├── tools/              # search, scholarly, page extraction, chunking, vector search
+│   │   ├── llm/                # provider abstraction, embeddings, pricing
+│   │   ├── reliability.py      # source reliability, claim and report confidence
+│   │   ├── data/domains.json   # versioned domain types
+│   │   ├── evals/              # seed set, gold sets, M7 benchmark harness
+│   │   └── testing.py          # scripted LLM, fake web, deterministic embeddings
+│   └── tests/
+├── frontend/                   # React + Vite web UI
+├── deploy/nginx/               # reverse proxy (SSE pass-through)
+├── docs/DEPLOY_AWS.md
+└── docker-compose*.yml         # dev, production, bundled database
+```
+
+Further reading: [ResearchMind_PRD.md](ResearchMind_PRD.md) (requirements),
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) (roadmap and as-built notes
+per milestone), and [AGENTS.md](AGENTS.md) (rules for contributors, including
+the package boundary).
 
 ## Milestones
 
@@ -517,9 +602,11 @@ with `run_id` and `worker_id` on every line written inside a run.
 - [x] **M2** — LLM and tool layer (provider-agnostic wrapper with usage/cost
       recording, embeddings, search with TTL cache, SSRF-guarded page extraction,
       vector search)
-- [ ] **M3** — MVP graph (Planner → Web Research → Synthesizer)
+- [ ] **M3** — MVP graph (Planner → Web Research → Synthesizer; `quick` mode).
+      Built and run live end to end; the full seed eval is pending.
 - [x] **M4** — API and background jobs (REST API, SSE with resume, cancel,
-      in-process job runner, API-key auth, rate limits, startup recovery)
+      API-key auth, rate limits; the in-process job runner later became M8's
+      database-backed queue)
 - [x] **M5** — Specialized agents and verification (technical, market, and
       academic researchers; claim extraction; fact checking; deterministic
       source reliability and claim/report confidence; `deep` and `academic`
@@ -538,7 +625,11 @@ with `run_id` and `worker_id` on every line written inside a run.
       shutdown, or `POST /resume`; `LISTEN/NOTIFY` for streams and cancels across
       processes; SSRF connections pinned to the vetted address; configurable
       CORS; `run_id`/`worker_id` on every log line; multi-stage Dockerfile,
-      Nginx, production compose, AWS guide, smoke tests)
+      Nginx, production compose, AWS guide, smoke tests). Verified on the local
+      production stack; an AWS deployment is pending.
+- [x] **Web UI** (beyond the PRD, which covers the backend only) — React + Vite
+      app for starting runs, live progress, reports, the evidence graph, and
+      sources and usage
 
 ## License
 
