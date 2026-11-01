@@ -46,20 +46,26 @@ researchmind/
 ├── docs/DEPLOY_AWS.md          # EC2 / ECS deployment
 ├── backend/
 │   ├── pyproject.toml
+│   ├── Dockerfile         # one image: API, worker, migrations
+│   ├── alembic/versions/  # migrations (Alembic)
+│   ├── scripts/           # run_mvp, eval_*, smoke_test
 │   ├── app/
 │   │   ├── main.py
 │   │   ├── core/          # config, logging, security, deps
 │   │   ├── api/v1/        # routers
 │   │   ├── models/        # SQLAlchemy models
 │   │   ├── schemas/       # Pydantic request/response
+│   │   ├── repositories/  # async CRUD and pgvector search
 │   │   ├── services/      # business logic, run queue, checkpointer, LISTEN bridge
 │   │   ├── workers/       # research worker (claims runs) and its task runner
-│   │   └── db/            # session, migrations (Alembic)
+│   │   └── db/            # session, shared DDL
 │   └── tests/
 ├── agents/
 │   ├── pyproject.toml
 │   ├── researchmind_agents/
 │   │   ├── config.py      # AgentConfig — built from backend Settings
+│   │   ├── runtime.py     # AgentRuntime: the injected usage sink, vector search, store
+│   │   ├── storage.py     # ResearchStore protocol + InMemoryResearchStore
 │   │   ├── modes.py       # research modes and the domains each may use
 │   │   ├── state.py       # shared LangGraph state
 │   │   ├── graph.py       # graph assembly (per mode)

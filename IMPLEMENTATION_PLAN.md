@@ -1,13 +1,14 @@
 # ResearchMind — Master Implementation Plan
 
-> **Status:** Active implementation
+> **Status:** Feature-complete (M0–M8 and the web UI built and tested offline); live evaluation pending
 > **Done:** M0, M1, M2, M4, M5, M6, M7 (offline acceptance), M8 (verified on the local
 > production stack; live checks pending: migrations 0003 and 0004 on Supabase, the M5
-> verification eval, the M6 contradiction eval and latency targets, and the M7 benchmark run)
+> verification eval, the M6 contradiction eval and latency targets, and the M7 benchmark run);
+> the React + Vite web UI in `frontend/` (beyond the PRD's backend scope)
 > **Open:** M3 seed eval, M5 verification eval, M6 contradiction eval and per-mode latency, M7
 > live benchmark (all need a live `GEMINI_API_KEY` run); an AWS deployment (guide written)
-> **Next:** the live evals and the M7 benchmark; then the frontend
-> **Last updated:** 2026-10-28
+> **Next:** the live evals and the M7 benchmark; then an AWS deployment
+> **Last updated:** 2026-11-01
 >
 > This is the single source of truth for the roadmap. `ResearchMind_PRD.md` holds
 > product requirements; `AGENTS.md` holds the rules every contributor/agent follows.
@@ -42,9 +43,9 @@ report in which every citation points to a stored source.
 | Runtime | Python 3.11+ (dev: 3.13) | |
 | API | FastAPI + Uvicorn | REST + SSE |
 | Schemas / settings | Pydantic v2, pydantic-settings | |
-| Orchestration | LangGraph 1.x + langchain-core | Checkpointing via Postgres saver from M4 |
+| Orchestration | LangGraph 1.x + langchain-core | Checkpointed every step (see Checkpoints) |
 | LLM | Provider-agnostic: `gemini` (default `gemini-3.1-flash-lite`) or `openai_compatible` (OpenRouter, Groq, vLLM, …) | Selected by `LLM_PROVIDER` |
-| Embeddings | Google embeddings, 768-dim | Default `text-embedding-004`; **verify availability**, migrate to `gemini-embedding-001` @ 768 dims if retired |
+| Embeddings | Google embeddings, 768-dim | `gemini-embedding-001` at 768 dims (`output_dimensionality`); `text-embedding-004` was shut down 2026-01-14 (migration 0002 records each passage's model) |
 | DB / vectors | PostgreSQL 16 + pgvector (HNSW, cosine) | Supabase or local Docker |
 | ORM / migrations | SQLAlchemy 2.0 async (asyncpg), Alembic | |
 | Web search | DuckDuckGo via `ddgs` (replaced `duckduckgo-search` in M3 — it silently returned no results) | Behind the `SearchProvider` interface (M3); Tavily/Brave/SearXNG as alternatives |
@@ -54,6 +55,7 @@ report in which every citation points to a stored source.
 | Realtime | SSE from `run_events` (ordered by `seq`) | Postgres LISTEN/NOTIFY across processes (M8); polling fallback |
 | Deployment | Multi-stage Dockerfile, Nginx, compose (M8) | `docs/DEPLOY_AWS.md` for EC2 / ECS |
 | Tracing | LangSmith via env (opt-in) | Run = trace, node = span (M4); LLM-call spans deferred |
+| Web UI | React 18 + Vite + TypeScript, `@xyflow/react` | Beyond the PRD's scope; see `frontend/README.md` |
 | Quality | pytest, pytest-asyncio, ruff, mypy | |
 
 ---
@@ -113,7 +115,7 @@ research_runs (id, question, mode, status, plan, iteration, error, ...)
 Each milestone ends with: all tests green, ruff + mypy clean, this file updated,
 and its **Done when** criteria met.
 
-### ⏳ M3 — MVP graph (current)
+### ⏳ M3 — MVP graph (seed eval pending)
 
 **Goal:** one question in, one grounded, cited report out, via `quick` mode.
 
@@ -639,32 +641,48 @@ C:\ResearchMind\
 ├── AGENTS.md                 # Operating rules
 ├── IMPLEMENTATION_PLAN.md    # This file
 ├── ResearchMind_PRD.md       # Product requirements
-├── pyproject.toml
-├── docker-compose.yml
+├── README.md                 # Setup, API, architecture
+├── pyproject.toml            # Shared ruff / mypy / pytest config
 ├── .env.example
+├── docker-compose.yml        # Development: one container (API + worker), reload
+├── docker-compose.prod.yml   # Nginx + API processes + workers + migrate (M8)
+├── docker-compose.localdb.yml  # Optional bundled PostgreSQL + pgvector
+├── deploy/nginx/             # Reverse proxy, SSE pass-through (M8)
+├── docs/DEPLOY_AWS.md        # EC2 / ECS guide (M8)
 ├── backend/
-│   ├── alembic/versions/     # 0001_initial_schema.py (+ 0002 in M3)
+│   ├── Dockerfile            # One image: API, worker, migrations (M8)
+│   ├── alembic/versions/     # 0001 schema, 0002 embedding model, 0003 event seq,
+│   │                         #   0004 run leases + checkpoints
+│   ├── scripts/              # run_mvp, eval_verification, eval_contradictions, smoke_test
 │   ├── app/
 │   │   ├── main.py
-│   │   ├── core/             # Settings, logging, security
-│   │   ├── api/v1/           # health (+ research in M4)
+│   │   ├── core/             # Settings, logging, security, errors, rate limit, tracing
+│   │   ├── api/v1/           # health, research
 │   │   ├── db/               # session, shared DDL
-│   │   ├── models/           # research, evidence, claims
+│   │   ├── models/           # research, evidence, claims, checkpoints
+│   │   ├── schemas/          # request/response shapes, evidence graph
 │   │   ├── repositories/     # async CRUD + vector search
-│   │   └── services/         # agent_runtime (+ job runner, scoring glue)
+│   │   ├── services/         # agent_runtime, research_store, run_queue, checkpointer,
+│   │   │                     #   event_stream, pg_listener, evidence_graph
+│   │   └── workers/          # research_worker (claims runs), job_runner
 │   └── tests/
 ├── agents/
 │   ├── researchmind_agents/
 │   │   ├── config.py         # AgentConfig dataclasses
-│   │   ├── state.py          # ResearchState + schemas (M3)
-│   │   ├── graph.py          # build_research_graph (M3)
+│   │   ├── runtime.py storage.py  # injected AgentRuntime, ResearchStore protocol
+│   │   ├── state.py          # ResearchState + schemas
+│   │   ├── graph.py modes.py # build_research_graph, per-mode agents and bounds
+│   │   ├── reliability.py coverage.py budget.py report.py
+│   │   ├── data/domains.json # versioned domain types
 │   │   ├── llm/              # base, providers, factory, pricing, embeddings
-│   │   ├── tools/            # search, page_extract, vector_search
-│   │   ├── prompts/          # (M3)
-│   │   ├── nodes/            # (M3)
-│   │   └── evals/            # seed set (M3), full harness (M7)
+│   │   ├── tools/            # search, scholarly, page_extract, chunking, excerpts, vector_search
+│   │   ├── prompts/          # one file per agent, plus eval judge and baselines
+│   │   ├── nodes/            # planner, researchers, claims, fact checker,
+│   │   │                     #   contradictions, sufficiency, synthesizer
+│   │   ├── evals/            # seed set (M3), gold sets (M5, M6), benchmark harness (M7)
+│   │   └── testing.py        # scripted LLM, fake web, deterministic embeddings
 │   └── tests/
-└── frontend/                 # Future React Flow UI
+└── frontend/                 # React + Vite web UI (runs, live progress, report, graph)
 ```
 
 ---
@@ -675,6 +693,8 @@ C:\ResearchMind\
 .venv\Scripts\python -m pytest agents/tests/ backend/tests/ -q
 .venv\Scripts\python -m ruff check agents/ backend/
 .venv\Scripts\python -m mypy agents/researchmind_agents/ backend/app/ --ignore-missing-imports
+cd frontend; npm run build    # tsc --noEmit + vite build
 ```
 
-All three must pass before a milestone is marked done. Tests use mocks and need no API keys.
+The three Python checks must pass before a milestone is marked done; the frontend build must
+pass for any change under `frontend/`. Tests use mocks and need no API keys.

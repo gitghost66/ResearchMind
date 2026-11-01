@@ -393,8 +393,8 @@ def select_claims(
     Claims a report may rest on, in plan order and best first within each
     top-level sub-question; evidence from sources outside *stored* is
     removed, and a claim left with no supporting passage is dropped. Within
-    *max_claims*, each sub-question's best claim comes first, then the claims
-    in *required* (those in a contradiction, so both sides can be shown), then
+    *max_claims*, the claims in *required* (those in a contradiction, so both
+    sides can be shown) come first, then each sub-question's best claim, then
     the rest round-robin across sub-questions.
     """
     root_of = root_ids(sub_questions)
@@ -425,11 +425,11 @@ def select_claims(
             taken.add(claim.id)
 
     for group in ordered_groups:
-        take(group[0])
-    for group in ordered_groups:
         for claim in group:
             if claim.id in must:
                 take(claim)
+    for group in ordered_groups:
+        take(group[0])
     for rank in range(max((len(g) for g in ordered_groups), default=0)):
         for group in ordered_groups:
             if rank < len(group) and len(picked) < limit and group[rank].id not in taken:

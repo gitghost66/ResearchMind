@@ -1114,7 +1114,9 @@ class TestM6Run:
         run_id = await api.create(mode="deep")
         detail = await api.wait_for(run_id, "completed")
 
-        assert detail["iteration"] == 1
+        # The fake gap planner adds nothing, so the round is logged in the plan
+        # but not counted: the run's iteration is the last round that researched.
+        assert detail["iteration"] == 0
         [round_] = detail["plan"]["rounds"]
         assert round_["iteration"] == 1 and round_["gaps"]
         steps = {s["agent"]: s for s in detail["progress"]["steps"]}
@@ -1125,7 +1127,7 @@ class TestM6Run:
         # The fake gap planner adds nothing, so round 1 goes straight to the report.
         assert [c["decision"] for c in checks] == ["loop"]
         report = (await api.client.get(f"{BASE}/{run_id}/report")).json()
-        assert report["content"]["coverage"]["iterations"] == 2
+        assert report["content"]["coverage"]["iterations"] == 1
 
     async def test_quick_mode_is_unchanged(self, api: ApiHarness) -> None:
         run_id = await api.create(mode="quick")
